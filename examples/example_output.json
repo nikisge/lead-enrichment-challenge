@@ -1,0 +1,86 @@
+{
+  "_comment": "This is what the pipeline RETURNS — the final EnrichmentResult. This is the OUTPUT.",
+  "examples": [
+    {
+      "_scenario": "Successful enrichment — IT job, found CTO as decision maker (IDEAL outcome)",
+      "success": true,
+      "company": {
+        "name": "TechVision GmbH",
+        "domain": "techvision-gmbh.de",
+        "industry": "Software / IT",
+        "location": "München",
+        "address": "Maximilianstraße 42, 80539 München",
+        "phone": "+49 89 123456789",
+        "website": "https://www.techvision-gmbh.de"
+      },
+      "decision_maker": {
+        "name": "Markus Wagner",
+        "first_name": "Markus",
+        "last_name": "Wagner",
+        "title": "CTO",
+        "linkedin_url": "https://www.linkedin.com/in/markus-wagner-techvision",
+        "email": "m.wagner@techvision-gmbh.de",
+        "verified_current": true,
+        "verification_note": null
+      },
+      "phone": {
+        "number": "+49 171 1234567",
+        "type": "mobile",
+        "source": "fullenrich",
+        "context_note": ""
+      },
+      "phone_status": "found_mobile",
+      "emails": ["m.wagner@techvision-gmbh.de", "bewerbung@techvision-gmbh.de"],
+      "enrichment_path": [
+        "llm_parse: company=TechVision GmbH",
+        "domain: techvision-gmbh.de (from job_url)",
+        "team_page: found 3 contacts on /team",
+        "candidate_ranked: Markus Wagner (CTO) score=95",
+        "linkedin_verified: current employee confirmed",
+        "phone: +49 171 1234567 via fullenrich"
+      ],
+      "job_id": "example-it-001",
+      "job_title": "Senior Software Engineer (m/w/d)"
+    },
+    {
+      "_scenario": "Current WRONG behavior — same IT job but system picks HR Manager instead of CTO",
+      "_problem": "THIS IS WHAT WE WANT TO FIX — HR should not always be #1",
+      "success": true,
+      "company": {
+        "name": "TechVision GmbH",
+        "domain": "techvision-gmbh.de",
+        "industry": "Software / IT",
+        "location": "München"
+      },
+      "decision_maker": {
+        "name": "Sandra Klein",
+        "first_name": "Sandra",
+        "last_name": "Klein",
+        "title": "HR Manager",
+        "linkedin_url": "https://www.linkedin.com/in/sandra-klein-hr",
+        "email": "s.klein@techvision-gmbh.de",
+        "verified_current": true,
+        "verification_note": null
+      },
+      "phone": {
+        "number": "+49 151 9876543",
+        "type": "mobile",
+        "source": "fullenrich",
+        "context_note": ""
+      },
+      "phone_status": "found_mobile",
+      "emails": ["s.klein@techvision-gmbh.de"],
+      "enrichment_path": [
+        "llm_parse: company=TechVision GmbH",
+        "domain: techvision-gmbh.de (from job_url)",
+        "team_page: found 3 contacts on /team",
+        "candidate_ranked: Sandra Klein (HR Manager) score=100  ← PROBLEM: HR always gets 100",
+        "candidate_ranked: Markus Wagner (CTO) score=60  ← PROBLEM: CTO only gets 60",
+        "linkedin_verified: current employee confirmed",
+        "phone: +49 151 9876543 via fullenrich"
+      ],
+      "job_id": "example-it-001",
+      "job_title": "Senior Software Engineer (m/w/d)"
+    }
+  ]
+}

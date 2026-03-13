@@ -1,0 +1,127 @@
+{
+  "_comment": "This shows the INTERMEDIATE steps of the pipeline — what happens between input and output. This helps you understand the data flow.",
+
+  "step_1_llm_parse_output": {
+    "_description": "llm_parser.py extracts this from the job posting text (ParsedJobPosting model)",
+    "company_name": "TechVision GmbH",
+    "company_domain": "techvision-gmbh.de",
+    "contact_name": null,
+    "contact_email": "bewerbung@techvision-gmbh.de",
+    "contact_phone": null,
+    "target_titles": ["CTO", "IT-Leiter", "Head of Engineering", "Tech Lead", "VP Engineering"],
+    "department": "IT / Software Engineering",
+    "location": "München",
+    "_NOTE": "target_titles and department are EXTRACTED but NEVER USED downstream — this is the main problem to fix!"
+  },
+
+  "step_2_domain_discovery": {
+    "_description": "pipeline.py finds the company domain through multiple strategies",
+    "domain": "techvision-gmbh.de",
+    "source": "job_url",
+    "confidence": "high"
+  },
+
+  "step_3_candidate_collection": {
+    "_description": "Candidates are collected from multiple sources with different trust levels",
+    "candidates": [
+      {
+        "name": "Markus Wagner",
+        "title": "CTO & Co-Founder",
+        "email": "m.wagner@techvision-gmbh.de",
+        "source": "team_page",
+        "priority": 70,
+        "_note": "Found on company /team page"
+      },
+      {
+        "name": "Sandra Klein",
+        "title": "HR Manager",
+        "email": "s.klein@techvision-gmbh.de",
+        "source": "team_page",
+        "priority": 70,
+        "_note": "Found on company /team page"
+      },
+      {
+        "name": "Thomas Braun",
+        "title": "Geschäftsführer",
+        "email": "t.braun@techvision-gmbh.de",
+        "source": "impressum",
+        "priority": 50,
+        "_note": "Found in company Impressum"
+      }
+    ]
+  },
+
+  "step_4_ai_validation_and_ranking": {
+    "_description": "ai_validator.py scores candidates — THIS IS WHERE THE PROBLEM IS",
+    "_current_scoring": {
+      "HR/Personal/Recruiting": "100 points (always highest!)",
+      "Department head matching job": "80 points",
+      "CEO/Geschäftsführer": "60 points",
+      "Other contacts": "40 points"
+    },
+    "_ideal_scoring_for_IT_job": {
+      "CTO/IT-Leiter (matches job)": "100 points (should be highest for IT jobs!)",
+      "HR Manager": "70 points (good fallback, but not #1)",
+      "CEO/Geschäftsführer": "60 points",
+      "Other contacts": "40 points"
+    },
+    "current_result": [
+      {
+        "name": "Sandra Klein",
+        "relevance_score": 100,
+        "overall_valid": true,
+        "_why": "HR Manager → always gets 100 in current system"
+      },
+      {
+        "name": "Markus Wagner",
+        "relevance_score": 60,
+        "overall_valid": true,
+        "_why": "CTO → only gets 60 as 'Geschäftsführer/CEO' category"
+      },
+      {
+        "name": "Thomas Braun",
+        "relevance_score": 60,
+        "overall_valid": true,
+        "_why": "Geschäftsführer → gets 60"
+      }
+    ],
+    "ideal_result": [
+      {
+        "name": "Markus Wagner",
+        "relevance_score": 100,
+        "overall_valid": true,
+        "_why": "CTO matches IT job → should be highest!"
+      },
+      {
+        "name": "Sandra Klein",
+        "relevance_score": 70,
+        "overall_valid": true,
+        "_why": "HR Manager → good fallback, but not #1 for IT job"
+      },
+      {
+        "name": "Thomas Braun",
+        "relevance_score": 60,
+        "overall_valid": true,
+        "_why": "Geschäftsführer → generic fallback"
+      }
+    ]
+  },
+
+  "step_5_linkedin_verification": {
+    "_description": "Top candidates are verified via LinkedIn/Apify (checks if they still work at the company)",
+    "verified_candidates": [
+      {
+        "name": "Markus Wagner",
+        "linkedin_url": "https://www.linkedin.com/in/markus-wagner-techvision",
+        "verified_current": true
+      }
+    ]
+  },
+
+  "step_6_phone_enrichment": {
+    "_description": "Phone numbers are found via BetterContact/FullEnrich/Kaspr APIs — NOT part of your task",
+    "phone": "+49 171 1234567",
+    "source": "fullenrich",
+    "type": "mobile"
+  }
+}

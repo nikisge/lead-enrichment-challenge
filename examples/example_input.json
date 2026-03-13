@@ -1,0 +1,65 @@
+{
+  "_comment": "This is what n8n sends to POST /webhook/enrich/sync — this is the INPUT to the pipeline",
+  "examples": [
+    {
+      "_scenario": "IT job — we want CTO/IT-Leiter, NOT HR Manager",
+      "id": "example-it-001",
+      "title": "Senior Software Engineer (m/w/d)",
+      "company": "TechVision GmbH",
+      "description": "Wir suchen einen erfahrenen Software Engineer für unser Cloud-Team. Sie entwickeln Microservices in Python und Go, arbeiten mit Kubernetes und AWS. Anforderungen: 5+ Jahre Erfahrung, Python, REST APIs, CI/CD. Wir bieten: Remote-first, 30 Tage Urlaub, modernes Tech-Stack. Standort: München. Ansprechpartner für Rückfragen: bewerbung@techvision-gmbh.de",
+      "category": "it",
+      "url": "https://www.techvision-gmbh.de/jobs/senior-software-engineer",
+      "location": "München",
+      "source": "stepstone",
+      "date_posted": "2026-03-10"
+    },
+    {
+      "_scenario": "Finance job — we want CFO/Finanzleiter, NOT HR Manager",
+      "id": "example-finance-002",
+      "title": "Finanzbuchhalter (m/w/d)",
+      "company": "Müller & Schmidt Steuerberatung",
+      "description": "Zur Verstärkung unseres Teams suchen wir einen Finanzbuchhalter. Aufgaben: Debitoren-/Kreditorenbuchhaltung, Monatsabschlüsse, USt-Voranmeldungen, Anlagenbuchhaltung. Voraussetzungen: Abgeschlossene kaufmännische Ausbildung, DATEV-Kenntnisse, mind. 3 Jahre Berufserfahrung. Kontakt: Frau Weber, personal@mueller-schmidt.de, Tel: 089-123456",
+      "category": "finance",
+      "url": "https://www.mueller-schmidt.de/karriere/finanzbuchhalter",
+      "location": "Stuttgart",
+      "source": "indeed",
+      "date_posted": "2026-03-08"
+    },
+    {
+      "_scenario": "Sales job — we want Vertriebsleiter/Head of Sales, NOT HR",
+      "id": "example-sales-003",
+      "title": "Account Manager B2B (m/w/d)",
+      "company": "IndustriePartner AG",
+      "description": "Als Account Manager betreuen Sie unsere B2B-Kunden im Bereich Maschinenbau. Aufgaben: Neukundenakquise, Bestandskundenpflege, Angebotserstellung, Vertragsverhandlungen. Sie berichten direkt an den Vertriebsleiter. Anforderungen: Technisches Verständnis, Verhandlungsgeschick, Reisebereitschaft 30%.",
+      "category": "sales",
+      "url": null,
+      "location": "Düsseldorf",
+      "source": "linkedin",
+      "date_posted": "2026-03-11"
+    },
+    {
+      "_scenario": "Healthcare job — we want Chefarzt/Klinikleiter, NOT HR",
+      "id": "example-health-004",
+      "title": "Pflegefachkraft (m/w/d) Intensivstation",
+      "company": "Klinikum Südbayern",
+      "description": "Für unsere Intensivstation suchen wir eine engagierte Pflegefachkraft. Aufgaben: Patientenversorgung, Monitoring, Dokumentation. Wir bieten: Tarifliche Vergütung, betriebliche Altersvorsorge, Fort- und Weiterbildung. Bewerbungen an: Pflegedirektion, Frau Dr. Berger.",
+      "category": "healthcare",
+      "url": "https://www.klinikum-suedbayern.de/karriere/pflege",
+      "location": "Rosenheim",
+      "source": "stepstone",
+      "date_posted": "2026-03-09"
+    },
+    {
+      "_scenario": "No category — system must figure out the right DM from context",
+      "id": "example-nocat-005",
+      "title": "Bauleiter Hochbau (m/w/d)",
+      "company": "Baufirma Schneider GmbH",
+      "description": "Wir suchen einen erfahrenen Bauleiter für Hochbauprojekte im Raum Frankfurt. Aufgaben: Baustellenleitung, Koordination der Subunternehmer, Qualitätskontrolle, Baufortschrittskontrolle. Anforderungen: Studium Bauingenieurwesen, 5+ Jahre Erfahrung im Hochbau.",
+      "category": null,
+      "url": null,
+      "location": "Frankfurt am Main",
+      "source": "indeed",
+      "date_posted": "2026-03-12"
+    }
+  ]
+}
