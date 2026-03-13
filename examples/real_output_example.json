@@ -1,0 +1,69 @@
+{
+  "_comment": "This is a REAL output from the current pipeline for Fischmann.IT GmbH. This is exactly what the API returns. Use this to understand the full output structure including company_intel, enrichment_path, and all fields.",
+  "success": true,
+  "company": {
+    "name": "Fischmann.IT GmbH",
+    "domain": "fischmann.it",
+    "industry": null,
+    "employee_count": null,
+    "location": "München, Deutschland",
+    "address": "Frauenstr. 32, 80469 München",
+    "phone": "+498912501255",
+    "website": "https://fischmann.it",
+    "linkedin_url": "https://de.linkedin.com/company/fischmann-it-gmbh"
+  },
+  "company_intel": {
+    "summary": "# Sales-Zusammenfassung: Fischmann.IT GmbH\n\n## Was macht das Unternehmen?\nFischmann.IT ist ein inhabergeführtes IT-Systemhaus aus München, das seit 15+ Jahren maßgeschneiderte IT-Lösungen, Betreuung und Managed Services für mittelständische Unternehmen anbietet.\n\n## Branche & Größe\nIT-Dienstleistungen | Kleines, familiäres Team (ca. 10-20 MA geschätzt) | 120+ Kunden im Großraum München\n\n## Aktuelle Situation\nSuchen IT-Dispatcher/Disponenten für Techniker-Einsatzplanung. Zeigt Wachstum im operativen Bereich.\n\n## Gesprächseinstieg\n\"Ich sehe, Sie expandieren operativ und optimieren Ihre Techniker-Disposition. Bei 120+ Kunden ist effiziente Einsatzplanung erfolgskritisch. Haben Sie parallel auch Bedarf an weiteren IT-Fachkräften?\"",
+    "description": "Über uns - Fischmann.IT aus München. Fischmann.IT GmbH – Ihr überregionaler IT-Dienstleister aus München. IT-Kompetenz aus München – persönlich, pragmatisch, professionell. Fischmann.IT steht seit über 15 Jahren für individuelle IT-Lösungen.",
+    "industry": "",
+    "employee_count": null,
+    "founded": null,
+    "headquarters": "",
+    "products_services": [],
+    "hiring_signals": [
+      "Moderne Arbeitsplatzkultur (Remote/Hybrid)",
+      "Attraktive Benefits: 30 Tage Urlaub"
+    ],
+    "website_url": "https://fischmann.it"
+  },
+  "decision_maker": {
+    "name": "Fabio Fischmann",
+    "first_name": "Fabio",
+    "last_name": "Fischmann",
+    "title": "Geschäftsführer",
+    "linkedin_url": "https://de.linkedin.com/in/fabio-fischmann",
+    "email": null,
+    "apollo_id": null,
+    "verified_current": true,
+    "verification_note": "Auf Firmenwebsite (impressum) + LinkedIn verifiziert"
+  },
+  "phone": null,
+  "phone_status": "api_no_result",
+  "emails": [
+    "info@fischmann.it",
+    "anfrage@fischmann.it"
+  ],
+  "enrichment_path": [
+    "llm_parse",
+    "domain:serper->fischmann.it",
+    "company_phone:serper->+4989125...",
+    "company_address:serper",
+    "impressum_ai_extracted",
+    "impressum_address_found",
+    "total_1_raw_candidates",
+    "validated_1_candidates",
+    "linkedin_found_Fabio",
+    "ai_name_match_Fabio",
+    "apify_verify_Fabio",
+    "linkedin_verified_Fabio",
+    "trusted_Fabio",
+    "using_best_candidate_no_phone",
+    "company_research",
+    "company_linkedin_found"
+  ],
+  "error": null,
+  "warnings": [],
+  "operational_alerts": {},
+  "job_id": "https://de.indeed.com/viewjob?jk=b580fe7976cb89ee",
+  "job_title": "IT-Disponent / IT-Dispatcher (m/w/d)"
+}
