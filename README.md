@@ -56,7 +56,9 @@ Currently, the system **always prioritizes HR managers and CEOs** as the decisio
 - For a **Software Developer** job → we want the **CTO / Head of IT**, not HR
 - For a **Accountant** job → we want the **CFO / Head of Finance**, not HR
 - For a **Sales Manager** job → we want the **Head of Sales / VP Sales**, not HR
-- HR Manager should be the **fallback**, not the default
+- **HR Managers should generally NOT be the target** — they are not the ones who benefit from a placement. The hiring manager (department head) is the real decision maker.
+- **Geschäftsführer/CEO from Impressum** is a better fallback than HR — they actually make hiring decisions
+- The **title/position** of the found contact person is critical context in the output — it must always be included
 
 ### What's Already There (But Unused!)
 
@@ -74,6 +76,9 @@ The LLM parser (`llm_parser.py`) already extracts two useful fields:
 | `pipeline.py` | Main orchestration — collects candidates from 5 sources | Search for `# --- Phase` comments |
 | `clients/ai_validator.py` | **`validate_and_rank_candidates()`** — AI scores candidates by relevance | The LLM prompt with scoring rules |
 | `clients/linkedin_search.py` | **`find_multiple_decision_makers()`** — Google search for DMs | Search queries and `_get_category_query()` |
+| `clients/team_discovery.py` | Finds and scrapes team/about pages on company websites | `discover_team_contacts()` |
+| `clients/job_scraper.py` | Scrapes the original job posting URL for contact info | Extract contacts from job pages |
+| `clients/ai_extractor.py` | AI-based extraction of contacts from page content | `extract_contacts_from_page()` |
 | `models.py` | Data models — `ParsedJobPosting`, `DecisionMaker`, etc. | |
 
 ### Current Scoring (in `ai_validator.py`)
@@ -91,11 +96,19 @@ Other named contacts:                       40 points
 
 **Minimum (required):**
 1. Pass `target_titles` and `department` from the parser through to the ranking and search functions
-2. Make the candidate scoring job-aware (department heads matching the job should rank higher than generic HR)
-3. Adjust the DM fallback search to search for job-relevant titles first, HR as fallback
+2. Make the candidate scoring job-aware — department heads matching the job should rank **highest**, not HR
+3. Adjust the DM fallback search to search for job-relevant titles first, Geschäftsführer as fallback, HR as last resort
+4. Ensure the decision maker's **title/position is always present** in the output (`DecisionMaker.title` field) — this is important context for the sales team
+5. Improve **team page scraping** and **job posting page scraping** to extract better candidates more reliably (see files: `clients/team_discovery.py`, `clients/job_scraper.py`, `clients/ai_extractor.py`)
+
+**Priority order for decision makers (what the recruitment agency actually needs):**
+1. **Department head matching the job** (e.g., CTO for IT jobs, CFO for finance jobs) — this person benefits from the placement
+2. **Geschäftsführer / CEO / Inhaber** (from Impressum) — they make hiring decisions
+3. **HR Manager** — last resort only, they don't directly benefit from a placement
 
 **Bonus (optional, shows initiative):**
 - Improve the `_get_default_titles()` mapping in `llm_parser.py`
+- Make team page and job page scraping smarter (better extraction, handle more page layouts)
 - Add smarter logic to match candidates to job types
 - Propose new data sources or approaches for finding the right DM
 - Any other improvements you think would help
@@ -200,7 +213,6 @@ Visit `http://localhost:8000/health` to verify it's running.
 
 - Phone enrichment clients (`kaspr.py`, `bettercontact.py`, `fullenrich.py`) — not part of this task
 - `company_research.py` — not part of this task
-- `impressum.py` — scraping logic, not part of this task
 - `config.py` — configuration, should stay as-is
 
 ---
