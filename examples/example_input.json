@@ -1,17 +1,19 @@
 {
-  "_comment": "This is what n8n sends to POST /webhook/enrich/sync — this is the INPUT to the pipeline",
+  "_comment": "This is what n8n sends to POST /webhook/enrich/sync — this is the INPUT to the pipeline. Note: contact_person and sent_by_user come from n8n but are not used by the WebhookPayload model (Pydantic ignores extra fields). The key fields are: id, title, company, description, category, url, location, source, date_posted.",
   "examples": [
     {
       "_scenario": "IT job — we want CTO/IT-Leiter, NOT HR Manager",
-      "id": "example-it-001",
-      "title": "Senior Software Engineer (m/w/d)",
-      "company": "TechVision GmbH",
-      "description": "Wir suchen einen erfahrenen Software Engineer für unser Cloud-Team. Sie entwickeln Microservices in Python und Go, arbeiten mit Kubernetes und AWS. Anforderungen: 5+ Jahre Erfahrung, Python, REST APIs, CI/CD. Wir bieten: Remote-first, 30 Tage Urlaub, modernes Tech-Stack. Standort: München. Ansprechpartner für Rückfragen: bewerbung@techvision-gmbh.de",
-      "category": "it",
-      "url": "https://www.techvision-gmbh.de/jobs/senior-software-engineer",
-      "location": "München",
-      "source": "stepstone",
-      "date_posted": "2026-03-10"
+      "id": "https://www.linkedin.com/jobs/view/4384159390",
+      "title": "Senior Digital and AI Lead",
+      "company": "HEUCK & COMPANY Unternehmensberatung GmbH",
+      "description": "We are seeking a Senior Digital and AI Lead for a contract position based in Starnberg with a hybrid work environment. In this role, you will be responsible for driving our digital strategy initiatives, supporting our AI project teams from conception to execution, and collaborating with cross-functional teams to deliver impactful results.\n\nQualifications:\n- Proven expertise in Digital / AI Strategy and Marketing\n- Knowledge of newest AI technologies and their application in business environments\n- Master's degree in Business Administration, Digital Transformation, Data Science, or a related field is preferred",
+      "category": "IT",
+      "url": "https://www.linkedin.com/jobs/view/4384159390",
+      "location": "Starnberg, Bavaria, Germany",
+      "source": "LinkedIn",
+      "date_posted": "2026-03-12",
+      "contact_person": null,
+      "sent_by_user": "Alexander Simon"
     },
     {
       "_scenario": "Finance job — we want CFO/Finanzleiter, NOT HR Manager",
@@ -23,7 +25,9 @@
       "url": "https://www.mueller-schmidt.de/karriere/finanzbuchhalter",
       "location": "Stuttgart",
       "source": "indeed",
-      "date_posted": "2026-03-08"
+      "date_posted": "2026-03-08",
+      "contact_person": null,
+      "sent_by_user": null
     },
     {
       "_scenario": "Sales job — we want Vertriebsleiter/Head of Sales, NOT HR",
@@ -35,7 +39,9 @@
       "url": null,
       "location": "Düsseldorf",
       "source": "linkedin",
-      "date_posted": "2026-03-11"
+      "date_posted": "2026-03-11",
+      "contact_person": null,
+      "sent_by_user": null
     },
     {
       "_scenario": "Healthcare job — we want Chefarzt/Klinikleiter, NOT HR",
@@ -47,7 +53,9 @@
       "url": "https://www.klinikum-suedbayern.de/karriere/pflege",
       "location": "Rosenheim",
       "source": "stepstone",
-      "date_posted": "2026-03-09"
+      "date_posted": "2026-03-09",
+      "contact_person": null,
+      "sent_by_user": null
     },
     {
       "_scenario": "No category — system must figure out the right DM from context",
@@ -59,7 +67,9 @@
       "url": null,
       "location": "Frankfurt am Main",
       "source": "indeed",
-      "date_posted": "2026-03-12"
+      "date_posted": "2026-03-12",
+      "contact_person": null,
+      "sent_by_user": null
     }
   ]
 }
