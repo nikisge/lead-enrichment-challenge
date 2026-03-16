@@ -696,6 +696,7 @@ async def _enrich_lead_inner(
                 company=parsed.company_name,
                 domain=company_info.domain,
                 job_category=payload.category,
+                target_titles=parsed.target_titles or None,
                 max_candidates=3
             )
             for dm in dm_candidates:
@@ -729,7 +730,9 @@ async def _enrich_lead_inner(
             candidates=all_candidates,
             company_name=parsed.company_name,
             company_domain=company_info.domain,
-            job_category=payload.category
+            job_category=payload.category,
+            target_titles=parsed.target_titles or None,
+            department=parsed.department
         )
         # Note: Tracking happens inside validate_and_rank_candidates (uses Sonnet)
 
@@ -748,6 +751,7 @@ async def _enrich_lead_inner(
                 company=parsed.company_name,
                 domain=company_info.domain,
                 job_category=payload.category,
+                target_titles=parsed.target_titles or None,
                 max_candidates=3
             )
             if dm_candidates:
@@ -761,7 +765,9 @@ async def _enrich_lead_inner(
                     candidates=new_candidates,
                     company_name=parsed.company_name,
                     company_domain=company_info.domain,
-                    job_category=payload.category
+                    job_category=payload.category,
+                    target_titles=parsed.target_titles or None,
+                    department=parsed.department
                 )
                 enrichment_path.append(f"dm_fallback_post_validation_{len(validated_candidates)}_found")
                 logger.info(f"DM fallback after validation found {len(validated_candidates)} candidates")

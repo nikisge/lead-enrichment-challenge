@@ -294,7 +294,9 @@ async def validate_and_rank_candidates(
     candidates: List[Dict[str, Any]],
     company_name: str,
     company_domain: Optional[str],
-    job_category: Optional[str] = None
+    job_category: Optional[str] = None,
+    target_titles: Optional[List[str]] = None,
+    department: Optional[str] = None
 ) -> List[CandidateValidation]:
     """
     Validate and rank all candidates in one AI call.
@@ -302,13 +304,15 @@ async def validate_and_rank_candidates(
     Validates:
     - Name is a real person
     - Email belongs to company
-    - Ranks by relevance for the job
+    - Ranks by relevance for the job (department head matching job > CEO > HR)
 
     Args:
         candidates: List of candidate dicts with name, email, title, source
         company_name: Company name
         company_domain: Company domain
         job_category: Job category for relevance scoring
+        target_titles: Preferred decision maker titles for this job (from parser)
+        department: Department for this job (from parser)
 
     Returns:
         List of validated candidates, sorted by relevance (highest first)
@@ -329,44 +333,35 @@ async def validate_and_rank_candidates(
 
     llm = get_llm_client()
 
-    category_context = f"\nDie Stelle ist im Bereich: {job_category}" if job_category else ""
+    job_context = []
+    if department:
+        job_context.append(f"Abteilung/Stelle: {department}")
+    if job_category:
+        job_context.append(f"Kategorie: {job_category}")
+    if target_titles:
+        job_context.append(f"Bevorzugte Ansprechpartner-Titel: {', '.join(target_titles)}")
+    context_line = "\n".join(job_context) if job_context else ""
 
-    prompt = f"""Validiere und bewerte diese Kontakt-Kandidaten für "{company_name}" (Domain: {company_domain or 'unbekannt'}).{category_context}
+    scoring = """3. relevance_score: 0-100 (Abteilungsleiter passend zur Stelle > CEO > HR)
+   - Titel passt zu Bevorzugte Ansprechpartner-Titel oder Abteilung (z.B. CTO/IT-Leiter bei IT-Stelle): 95
+   - Geschäftsführer/CEO/Inhaber: 65
+   - HR/Personal/Recruiting: 45 (nur letzter Ausweg)
+   - Sonstige: 35. Ungültige: 0"""
+
+    prompt = f"""Validiere und bewerte diese Kontakt-Kandidaten für "{company_name}" (Domain: {company_domain or 'unbekannt'}).{f' {context_line}' if context_line else ''}
 
 Kandidaten:
 {filtered_candidates}
 
 Prüfe für JEDEN Kandidaten:
 
-1. name_valid: Ist der Name ein echter Personenname?
-   - UNGÜLTIG: Überschriften, Menüpunkte, Platzhalter, Firmennamen
-   - GÜLTIG: Echte Vor- und Nachnamen
-
-2. email_valid: Gehört die E-Mail zur Firma?
-   - GÜLTIG: Gleiche Domain, Subdomain, Mutter-/Tochterfirma
-   - UNGÜLTIG: Komplett andere Firma (z.B. @freewheel.com bei Diakoneo)
-
-3. relevance_score: 0-100 Punkte
-   - HR/Personal/Recruiting: 100
-   - Abteilungsleiter passend zur Stelle: 80
-   - Geschäftsführer/CEO/Inhaber: 60
-   - Sonstige benannte Kontakte: 40
-   - Ungültige Kandidaten: 0
-
+1. name_valid: Ist der Name ein echter Personenname? (UNGÜLTIG: Überschriften, Menüpunkte, Firmennamen. GÜLTIG: Echte Vor- und Nachnamen)
+2. email_valid: Gehört die E-Mail zur Firma? (Gleiche Domain/Subdomain = GÜLTIG; andere Firma = UNGÜLTIG)
+{scoring}
 4. overall_valid: true wenn name_valid UND (keine E-Mail ODER email_valid)
 
 Antworte als JSON-Array, sortiert nach relevance_score (höchste zuerst):
-[{{
-    "name": "...",
-    "name_valid": true/false,
-    "name_reason": "...",
-    "email": "..." oder null,
-    "email_valid": true/false,
-    "email_reason": "...",
-    "overall_valid": true/false,
-    "relevance_score": 0-100,
-    "validation_notes": "Kurze Zusammenfassung"
-}}]"""
+[{{"name": "...", "name_valid": true/false, "name_reason": "...", "email": "..." oder null, "email_valid": true/false, "email_reason": "...", "overall_valid": true/false, "relevance_score": 0-100, "validation_notes": "..."}}]"""
 
     result = await llm.call_json(prompt, tier=ModelTier.BALANCED)
     track_llm("candidate_validate", tier="sonnet")  # Batch validation uses Sonnet

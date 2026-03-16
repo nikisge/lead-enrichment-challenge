@@ -383,6 +383,7 @@ class LinkedInSearchClient:
         company: str,
         domain: Optional[str] = None,
         job_category: Optional[str] = None,
+        target_titles: Optional[List[str]] = None,
         max_candidates: int = 3
     ) -> List[dict]:
         """
@@ -390,14 +391,15 @@ class LinkedInSearchClient:
         Returns up to max_candidates, prioritizing verified current employees.
 
         Priority:
-        1. HR / Recruiting / Personal (best for job postings)
-        2. Department head matching job category
-        3. General executives (fallback)
+        1. Job-relevant titles (target_titles / category)
+        2. Geschäftsführer / CEO / Inhaber (fallback)
+        3. HR / Recruiting / Personal (last resort)
 
         Args:
             company: Company name
             domain: Company domain (optional)
             job_category: Job category like "IT", "Sales", etc.
+            target_titles: Preferred titles from parser (e.g. CTO, IT-Leiter for IT jobs)
             max_candidates: Maximum number of candidates to return (default 3)
 
         Returns:
@@ -410,39 +412,32 @@ class LinkedInSearchClient:
         all_candidates = []
         seen_urls = set()
 
-        # Search 1: HR/Recruiting (combined query)
-        hr_query = "Personalleiter OR HR OR Recruiting OR Personal"
-        candidates = await self._search_decision_maker_combined(company, hr_query, domain, return_all=True)
-        for c in candidates:
-            if c["linkedin_url"] not in seen_urls:
-                seen_urls.add(c["linkedin_url"])
-                all_candidates.append(c)
+        def add_unique(candidates_found):
+            for c in candidates_found:
+                if c["linkedin_url"] not in seen_urls:
+                    seen_urls.add(c["linkedin_url"])
+                    all_candidates.append(c)
 
-        # Search 2: Job-category specific (if category provided)
+        # Search 1: Job-relevant titles (target_titles or category)
+        if target_titles:
+            q = " OR ".join(f'"{t}"' for t in target_titles[:6])
+            add_unique(await self._search_decision_maker_combined(company, q, domain, return_all=True))
         if job_category:
             category_query = self._get_category_query(job_category)
             if category_query:
-                candidates = await self._search_decision_maker_combined(company, category_query, domain, return_all=True)
-                for c in candidates:
-                    if c["linkedin_url"] not in seen_urls:
-                        seen_urls.add(c["linkedin_url"])
-                        all_candidates.append(c)
+                add_unique(await self._search_decision_maker_combined(company, category_query, domain, return_all=True))
 
-        # Search 3: Executive fallback
+        # Search 2: Executive fallback
         exec_query = "Geschäftsführer OR CEO OR Inhaber OR Managing Director"
-        candidates = await self._search_decision_maker_combined(company, exec_query, domain, return_all=True)
-        for c in candidates:
-            if c["linkedin_url"] not in seen_urls:
-                seen_urls.add(c["linkedin_url"])
-                all_candidates.append(c)
+        add_unique(await self._search_decision_maker_combined(company, exec_query, domain, return_all=True))
 
-        # Sort: verified first, then by score
+        # Search 3: HR last resort
+        hr_query = "Personalleiter OR HR OR Recruiting OR Personal"
+        add_unique(await self._search_decision_maker_combined(company, hr_query, domain, return_all=True))
+
         all_candidates.sort(key=lambda x: (not x.get("verified_current", False), -x.get("score", 0)))
-
-        # Return top candidates
         result = all_candidates[:max_candidates]
-        logger.info(f"Found {len(result)} decision maker candidates for {company} (verified: {sum(1 for c in result if c.get('verified_current'))})")
-
+        logger.info(f"Found {len(result)} decision maker candidates for {company}")
         return result
 
     def _get_category_query(self, category: str) -> Optional[str]:
