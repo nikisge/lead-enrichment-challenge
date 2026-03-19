@@ -1,13 +1,35 @@
 """Company Research - Free company intelligence for sales calls."""
 import logging
 import re
-import httpx
+from curl_cffi.requests import AsyncSession
 from typing import Optional, List
 from dataclasses import dataclass, field
 from bs4 import BeautifulSoup
 
 from config import get_settings
 from utils.cost_tracker import track_llm
+from clients.llm_client import get_llm_client, ModelTier
+
+# Phrases that indicate a JS-gate / bot-check page with no real content
+_JS_BLOCK_PHRASES = [
+    "javascript must be enabled",
+    "javascript is required",
+    "please enable javascript",
+    "bitte aktivieren sie javascript",
+    "bitte javascript aktivieren",
+    "enable javascript to continue",
+    "your browser does not support javascript",
+]
+
+# Phrases that indicate an access-denied / bot-block response
+_ACCESS_DENIED_PHRASES = [
+    "access denied",
+    "you don't have permission to access",
+    "403 forbidden",
+    "blocked by",
+    "captcha",
+    "bot detected",
+]
 
 logger = logging.getLogger(__name__)
 
@@ -35,7 +57,6 @@ class CompanyResearcher:
     def __init__(self):
         settings = get_settings()
         self.timeout = settings.api_timeout
-        self.anthropic_key = settings.anthropic_api_key
 
     async def research(
         self,
@@ -85,9 +106,48 @@ class CompanyResearcher:
 
         return intel
 
+    def _is_js_blocked(self, text: str) -> bool:
+        """Return True if the page text is a JS-gate rather than real content."""
+        text_lower = text.lower()
+        return any(phrase in text_lower for phrase in _JS_BLOCK_PHRASES)
+
+    def _is_access_denied(self, text: str) -> bool:
+        """Return True if the page is an access-denied / bot-block response."""
+        text_lower = text.lower()
+        return any(phrase in text_lower for phrase in _ACCESS_DENIED_PHRASES)
+
+    async def _scrape_url_with_playwright(self, url: str) -> Optional[str]:
+        """Fetch a URL via sync Playwright in a thread executor."""
+        import asyncio
+
+        def _sync_fetch() -> Optional[str]:
+            try:
+                from playwright.sync_api import sync_playwright
+                with sync_playwright() as p:
+                    browser = p.chromium.launch(headless=True)
+                    try:
+                        context = browser.new_context(
+                            viewport={"width": 1280, "height": 720},
+                        )
+                        page = context.new_page()
+                        page.goto(url, wait_until="domcontentloaded", timeout=15000)
+                        page.wait_for_timeout(2000)
+                        return page.content()
+                    finally:
+                        browser.close()
+            except Exception as e:
+                logger.debug(f"Playwright failed for {url}: {e}")
+                return None
+
+        try:
+            loop = asyncio.get_event_loop()
+            return await loop.run_in_executor(None, _sync_fetch)
+        except Exception as e:
+            logger.debug(f"Playwright executor failed for {url}: {e}")
+            return None
+
     async def _scrape_about_page(self, domain: str) -> str:
-        """Scrape company about/über uns page."""
-        # Common about page paths for German companies
+        """Scrape company about/über uns page, falling back to Playwright on JS-gated pages."""
         about_paths = [
             "/ueber-uns",
             "/uber-uns",
@@ -97,25 +157,33 @@ class CompanyResearcher:
             "/company",
             "/wir",
             "/team",
-            "/",  # Homepage often has company description
+            "/",
         ]
 
         combined_text = []
 
-        async with httpx.AsyncClient(
-            timeout=self.timeout,
-            follow_redirects=True,
-            headers={"User-Agent": "Mozilla/5.0 (compatible; LeadEnrichBot/1.0)"}
-        ) as client:
-            for path in about_paths[:4]:  # Limit to first 4 paths
+        async with AsyncSession(impersonate="chrome136") as session:
+            for path in about_paths[:4]:
                 url = f"https://{domain}{path}"
                 try:
-                    response = await client.get(url)
-                    if response.status_code == 200:
-                        text = self._extract_text_from_html(response.text)
-                        if text and len(text) > 100:
-                            combined_text.append(text)
-                            logger.debug(f"Scraped {url}: {len(text)} chars")
+                    response = await session.get(url, timeout=self.timeout, allow_redirects=True)
+                    if response.status_code != 200:
+                        continue
+
+                    text = self._extract_text_from_html(response.text)
+
+                    # If JS-gated, retry with Playwright
+                    if not text or len(text) < 100 or self._is_js_blocked(text):
+                        logger.info(f"JS-blocked page detected for {url}, retrying with Playwright")
+                        html = await self._scrape_url_with_playwright(url)
+                        if html:
+                            text = self._extract_text_from_html(html)
+
+                    if text and len(text) > 100 and not self._is_js_blocked(text) and not self._is_access_denied(text):
+                        combined_text.append(text)
+                        logger.debug(f"Scraped {url}: {len(text)} chars")
+                    elif text and self._is_access_denied(text):
+                        logger.debug(f"Access denied for {url}, skipping")
                 except Exception as e:
                     logger.debug(f"Failed to scrape {url}: {e}")
                     continue
@@ -226,17 +294,11 @@ class CompanyResearcher:
         job_title: Optional[str],
         hiring_signals: List[str]
     ) -> str:
-        """Generate AI sales brief using Claude."""
-        if not self.anthropic_key:
-            return self._generate_fallback_brief(company_name, about_text, hiring_signals)
-
-        try:
-            from anthropic import AsyncAnthropic
-
-            client = AsyncAnthropic(api_key=self.anthropic_key)
-
-            prompt = f"""Du bist ein Sales Research Assistant für eine Personalberatung.
+        """Generate AI sales brief using LLMClient (OpenRouter)."""
+        prompt = f"""Du bist ein Sales Research Assistant für eine Personalberatung.
 Erstelle eine kurze, prägnante Zusammenfassung für einen Sales Call.
+
+WICHTIG: Verwende NUR die unten angegebenen Informationen. Ergänze NICHTS aus deinem eigenen Wissen über das Unternehmen.
 
 UNTERNEHMEN: {company_name}
 
@@ -253,25 +315,23 @@ ERKANNTE HIRING-SIGNALE:
 ---
 
 Erstelle eine Sales-Zusammenfassung mit:
-1. **Was macht das Unternehmen?** (1-2 Sätze)
-2. **Branche & Größe** (wenn erkennbar)
+1. **Was macht das Unternehmen?** (1-2 Sätze – nur wenn aus den obigen Daten erkennbar, sonst weglassen)
+2. **Branche & Größe** (nur wenn aus den obigen Daten erkennbar)
 3. **Aktuelle Situation** (warum stellen sie ein?)
 4. **Gesprächseinstieg** (ein konkreter Aufhänger für den Call)
 
 Halte es kurz und actionable (max 150 Wörter). Schreibe auf Deutsch."""
 
-            response = await client.messages.create(
-                model="claude-sonnet-4-20250514",
-                max_tokens=500,
-                messages=[{"role": "user", "content": prompt}]
-            )
-            track_llm("company_research", tier="sonnet")  # Track company research LLM call
-
-            return response.content[0].text.strip()
-
+        try:
+            llm = get_llm_client()
+            response = await llm.call(prompt, tier=ModelTier.BALANCED, max_tokens=500)
+            track_llm("company_research", tier="haiku")
+            if response.success:
+                return response.content.strip()
         except Exception as e:
             logger.error(f"Failed to generate AI brief: {e}")
-            return self._generate_fallback_brief(company_name, about_text, hiring_signals)
+
+        return self._generate_fallback_brief(company_name, about_text, hiring_signals)
 
     def _generate_fallback_brief(
         self,

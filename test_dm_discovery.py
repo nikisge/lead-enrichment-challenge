@@ -4,6 +4,7 @@ Test Decision Maker Discovery - Prioritized Search (HR > Dept Head > Exec)
 """
 import asyncio
 import logging
+import sys
 from dotenv import load_dotenv
 
 # Load environment variables

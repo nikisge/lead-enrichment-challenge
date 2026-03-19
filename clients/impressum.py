@@ -1,6 +1,6 @@
 import logging
 import re
-import httpx
+from curl_cffi.requests import AsyncSession
 import xml.etree.ElementTree as ET
 from typing import Optional, List
 from bs4 import BeautifulSoup
@@ -136,11 +136,7 @@ class ImpressumScraper:
 
         all_members = []
 
-        async with httpx.AsyncClient(
-            timeout=self.timeout,
-            follow_redirects=True,
-            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-        ) as client:
+        async with AsyncSession(impersonate="chrome136") as session:
             # Try max 3 URLs to avoid too many requests
             tried = 0
             for url in team_urls:
@@ -148,7 +144,7 @@ class ImpressumScraper:
                     break
 
                 try:
-                    response = await client.get(url)
+                    response = await session.get(url, timeout=self.timeout, allow_redirects=True)
                     if response.status_code != 200:
                         continue
 
@@ -270,43 +266,59 @@ class ImpressumScraper:
         if len(words) < 2:
             return False
 
-        # Filter out obvious non-names
-        invalid_patterns = [
+        text_lower = text.lower()
+        words_in_name = set(text_lower.split())
+
+        # Block 1: Filter obvious non-names.
+        # Short tokens ('ag', 'kg', 'ug', 'weg') use word-set to avoid rejecting surnames
+        # like "Haagen" ('ag' in 'haagen') or "Wegner" ('weg' in 'wegner').
+        short_token_invalid = {'gmbh', 'ag', 'kg', 'mbh', 'ohg', 'ug', 'weg'}
+        if words_in_name & short_token_invalid:
+            return False
+
+        # Safe patterns: these strings cannot appear as substrings of real German surnames
+        safe_substring_invalid = [
             'kontakt', 'email', 'telefon', 'adresse', 'impressum',
-            'gmbh', 'ag', 'kg', 'mbh', 'ohg', 'ug',
-            'straße', 'str.', 'platz', 'weg',
+            'straße', 'str.', 'platz',
             '@', 'www', 'http', '.de', '.com',
             'mehr erfahren', 'weiterlesen', 'zum profil'
         ]
-
-        text_lower = text.lower()
-        if any(p in text_lower for p in invalid_patterns):
+        if any(p in text_lower for p in safe_substring_invalid):
             return False
 
-        # Filter out job titles that are NOT person names
-        job_title_patterns = [
+        # Block 2: Filter job titles that are NOT person names.
+        # Single-token patterns use word-set intersection to avoid rejecting surnames
+        # like "Leitner" ('leiter' in 'leitner').
+        single_token_invalid = {
             'präsident', 'vizepräsident', 'vize',
             'teamleiter', 'abteilungsleiter', 'bereichsleiter', 'gruppenleiter',
-            'geschäftsführ', 'geschäftsleitung',
             'vorstand', 'aufsichtsrat', 'beirat',
             'direktor', 'director',
             'manager', 'leiter', 'leiterin',
             'chef', 'chefin',
-            'head of', 'senior', 'junior',
-            'assistent', 'assistentin', 'sekretär',
+            'senior', 'junior',
+            'assistent', 'assistentin',
             'mitarbeiter', 'angestellte',
             'partner', 'gesellschafter',
-            'inhaber', 'inhaberin', 'eigentümer',
+            'inhaber', 'inhaberin',
             'gründer', 'gründerin', 'founder',
             'ceo', 'cto', 'cfo', 'coo', 'cmo', 'cio',
             'managing', 'executive', 'officer',
             'consultant', 'berater', 'beraterin',
             'entwickler', 'developer', 'engineer',
-            'und team', 'unser team', 'das team',
-        ]
+        }
+        if words_in_name & single_token_invalid:
+            return False
 
-        # Check if text is primarily a job title (not a real name)
-        if any(p in text_lower for p in job_title_patterns):
+        # Multi-word / compound patterns: substring matching is safe here because
+        # these strings cannot appear as substrings of real German surnames
+        multi_word_invalid = [
+            'head of', 'und team', 'unser team', 'das team',
+            'geschäftsführ', 'geschäftsleitung',
+            'sekretär',
+            'eigentümer',
+        ]
+        if any(p in text_lower for p in multi_word_invalid):
             return False
 
         # First word should start with uppercase
@@ -375,14 +387,10 @@ class ImpressumScraper:
         impressum_keywords = ['impressum', 'kontakt', 'contact', 'imprint']
         found_urls = []
 
-        async with httpx.AsyncClient(
-            timeout=10,
-            follow_redirects=True,
-            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-        ) as client:
+        async with AsyncSession(impersonate="chrome136") as session:
             for sitemap_url in sitemap_urls:
                 try:
-                    response = await client.get(sitemap_url)
+                    response = await session.get(sitemap_url, timeout=10, allow_redirects=True)
                     if response.status_code != 200:
                         continue
 
@@ -428,56 +436,53 @@ class ImpressumScraper:
         return self._parse_impressum_html(html, url)
 
     async def _fetch_with_httpx(self, url: str) -> Optional[str]:
-        """Fetch page HTML via httpx. Returns None on any error."""
-        async with httpx.AsyncClient(
-            timeout=self.timeout,
-            follow_redirects=True,
-            headers={
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-            }
-        ) as client:
-            try:
-                response = await client.get(url)
+        """Fetch page HTML via curl_cffi (Chrome 136 TLS fingerprint). Returns None on any error."""
+        try:
+            async with AsyncSession(impersonate="chrome136") as session:
+                response = await session.get(url, timeout=self.timeout, allow_redirects=True)
                 response.raise_for_status()
                 return response.text
-            except httpx.HTTPStatusError as e:
-                logger.debug(f"Impressum page not found: {url} ({e.response.status_code})")
-                return None
-            except Exception as e:
-                logger.debug(f"httpx failed for {url}: {e}, will try Playwright fallback")
-                return None
+        except Exception as e:
+            logger.debug(f"curl_cffi failed for {url}: {e}, will try Playwright fallback")
+            return None
 
     async def _fetch_with_playwright(self, url: str) -> Optional[str]:
-        """Fetch page HTML via Playwright. Tolerates broken HTTP headers."""
-        try:
-            from playwright.async_api import async_playwright
-            from clients.job_scraper import _playwright_semaphore
+        """Fetch page HTML via sync Playwright in a thread executor (avoids event loop conflicts on Windows)."""
+        import asyncio
+        from clients.job_scraper import _playwright_semaphore
 
-            async with _playwright_semaphore:
-                async with async_playwright() as p:
-                    browser = await p.chromium.launch(
+        def _sync_fetch() -> Optional[str]:
+            try:
+                from playwright.sync_api import sync_playwright
+                with sync_playwright() as p:
+                    browser = p.chromium.launch(
                         headless=True,
                         args=['--disable-http2', '--disable-blink-features=AutomationControlled']
                     )
                     try:
-                        context = await browser.new_context(
+                        context = browser.new_context(
                             viewport={'width': 1280, 'height': 720},
                             user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                            extra_http_headers={
-                                'Accept-Language': 'de-DE,de;q=0.9,en;q=0.8',
-                            }
+                            extra_http_headers={'Accept-Language': 'de-DE,de;q=0.9,en;q=0.8'}
                         )
-                        page = await context.new_page()
-                        await page.goto(url, wait_until='domcontentloaded', timeout=10000)
-                        await page.wait_for_timeout(1000)
-                        html = await page.content()
+                        page = context.new_page()
+                        page.goto(url, wait_until='domcontentloaded', timeout=10000)
+                        page.wait_for_timeout(1000)
+                        html = page.content()
                         logger.info(f"Playwright fallback succeeded for {url} ({len(html)} bytes)")
                         return html
                     finally:
-                        await browser.close()
+                        browser.close()
+            except Exception as e:
+                logger.warning(f"Playwright fallback also failed for {url}: {e}")
+                return None
 
+        try:
+            loop = asyncio.get_event_loop()
+            async with _playwright_semaphore:
+                return await loop.run_in_executor(None, _sync_fetch)
         except Exception as e:
-            logger.warning(f"Playwright fallback also failed for {url}: {e}")
+            logger.warning(f"Playwright executor failed for {url}: {e}")
             return None
 
     def _parse_impressum_html(self, html: str, url: str) -> Optional[ImpressumResult]:

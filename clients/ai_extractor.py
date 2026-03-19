@@ -304,72 +304,171 @@ Falls KEIN Ansprechpartner gefunden wurde:
 async def extract_contacts_with_priority(
     page_text: str,
     company_name: str,
-    job_category: Optional[str] = None
+    job_category: Optional[str] = None,
+    target_titles: List[str] = []
 ) -> List[ExtractedContact]:
     """
-    Extract contacts and prioritize by relevance.
+    Single LLM call: extract contacts AND score by relevance.
 
-    Priority:
-    1. HR / Recruiting (100)
-    2. Department head matching job category (80)
-    3. Executives / Geschäftsführer (60)
-    4. Other named contacts (40)
+    Replaces the old two-step approach (extract then separately score)
+    with one merged call. Uses BALANCED tier because extracting contacts
+    from unstructured team page HTML is a harder task than scoring alone.
 
     Args:
         page_text: Page content
         company_name: Company name
         job_category: Optional job category for relevance scoring
+        target_titles: Ideal decision-maker titles for scoring boost
 
     Returns:
-        List of contacts sorted by priority
+        List of contacts sorted by priority (highest first)
     """
-    contacts = await extract_contacts_from_page(page_text, company_name, "team")
-
-    if not contacts:
+    if not page_text or len(page_text.strip()) < 50:
+        logger.info(f"Page text too short for extraction: {len(page_text)} chars")
         return []
 
-    # Build priority scoring prompt
+    # Smart truncation: keep head (intros) and tail (contact sections)
+    text = truncate_text(page_text)
+
     llm = get_llm_client()
 
-    contacts_data = [
-        {"name": c.name, "title": c.title or "Unbekannt"}
-        for c in contacts
-    ]
+    titles_hint = f"\nGesuchte Titel: {', '.join(target_titles[:4])}" if target_titles else ""
+    category_hint = f"\nStelle im Bereich: {job_category}" if job_category else ""
 
-    category_hint = f"\nDie Stelle ist im Bereich: {job_category}" if job_category else ""
+    prompt = f"""Extrahiere Kontaktpersonen von der Team-/Über-uns-Seite von "{company_name}".{titles_hint}{category_hint}
 
-    prompt = f"""Bewerte diese Kontakte von "{company_name}" nach Relevanz als Ansprechpartner für Bewerbungen.{category_hint}
+Für jede Person gib an:
+- name: Name der Person. Vollständiger Name (Vor- und Nachname) bevorzugt. Falls auf der Seite nur Vornamen stehen (üblich bei kleinen Firmen), ist der Vorname allein OK.
+- title: Position/Titel (falls erkennbar)
+- email: E-Mail (falls vorhanden)
+- phone: Telefon (falls vorhanden)
+- priority: Relevanz 1-100
+  - Titel entspricht gesuchtem Profil: 100
+  - Geschäftsführer/CEO/Inhaber: 75
+  - HR/Personal: 40
+  - Sonstige: 20
 
-Kontakte:
-{contacts_data}
+Seiteninhalt:
+{text}
 
-Bewertungskriterien:
-- HR/Personal/Recruiting: 100 Punkte
-- Abteilungsleiter passend zur Stelle: 80 Punkte
-- Geschäftsführer/CEO/Inhaber: 60 Punkte
-- Sonstige: 40 Punkte
+Antworte als JSON-Array, sortiert nach priority (höchste zuerst):
+[{{"name": "...", "title": "...", "email": null, "phone": null, "priority": 80}}]"""
 
-Antworte als JSON-Array, sortiert nach Priorität (höchste zuerst):
-[{{"name": "...", "priority": 100}}]"""
+    result = await llm.call_json(prompt, tier=ModelTier.BALANCED)
+    track_llm("contact_extract_priority", tier="sonnet")
+
+    if not isinstance(result, list):
+        logger.warning(f"AI priority extraction returned unexpected type: {type(result)}")
+        return []
+    if not result:
+        logger.info("AI priority extraction: no contacts found on page")
+        return []
+
+    contacts = []
+    for item in result:
+        if not isinstance(item, dict):
+            continue
+
+        name = item.get("name", "").strip()
+        if not name or len(name) < 2:
+            continue
+
+        title = item.get("title", "")
+        # Allow first-name-only entries from team pages IF accompanied by a job title.
+        # Many DACH company team pages show only first names (e.g. "Thomas - Teamleiter").
+        # Require 2+ words only when no title is present (to block nav items / headings).
+        if len(name.split()) < 2 and not title:
+            continue
+
+        contacts.append(ExtractedContact(
+            name=name,
+            title=title or None,
+            email=item.get("email"),
+            phone=item.get("phone"),
+            source="team",
+            confidence=min(item.get("priority", 50) / 100, 1.0)
+        ))
+
+    logger.info(f"Extracted {len(contacts)} contacts with priority from team page")
+    return contacts
+
+
+async def extract_hiring_manager_from_description(
+    description: str,
+    company_name: str,
+    job_title: str
+) -> Optional[ExtractedContact]:
+    """
+    Find hiring manager signals in the job posting body.
+
+    Distinct from extract_job_posting_contact() which finds the HR application
+    contact. This function looks for who the candidate would *report to* —
+    a fundamentally different and higher-value signal.
+
+    Patterns: "berichten an", "Führungskraft", "fachliche Fragen", "Team leitet".
+    Runs in the parallel Phase 2 block at zero extra HTTP latency.
+    """
+    if not description or len(description.strip()) < 100:
+        return None
+
+    text = truncate_text(description, max_chars=8000)
+
+    llm = get_llm_client()
+
+    prompt = f"""Analysiere diese Stellenanzeige von "{company_name}" für die Position "{job_title}".
+
+Suche nach Hinweisen auf den DIREKTEN VORGESETZTEN (nicht den HR-Ansprechpartner für Bewerbungen).
+
+Typische Muster:
+- "Sie berichten direkt an den CTO" / "berichten an" / "direkt unterstellt"
+- "Ihre zukünftige Führungskraft: Thomas Müller"
+- "Bei fachlichen Fragen: Tobias Bauer (Leiter Vertrieb)"
+- "Das Team wird geleitet von ..."
+- "Unser [Titel] [Name] freut sich auf Sie"
+
+WICHTIG:
+- Suche nach dem FÜHRUNGSVERANTWORTLICHEN, nicht dem HR-Kontakt für Bewerbungen
+- Nur wenn explizit ein Name ODER klarer Titel genannt wird
+- NICHT: "Bewerbung an", "Ansprechpartner für Fragen zu Ihrer Bewerbung"
+
+Text:
+{text}
+
+Falls ein Vorgesetzter/Führungskraft identifiziert wurde:
+{{"found": true, "name": "Thomas Müller", "title": "CTO"}}
+
+Falls KEIN Vorgesetzter direkt genannt wird:
+{{"found": false, "name": null, "title": null}}"""
 
     result = await llm.call_json(prompt, tier=ModelTier.FAST)
+    track_llm("hiring_manager_extract", tier="haiku")
 
-    if not result or not isinstance(result, list):
-        return contacts
+    if not result or not isinstance(result, dict):
+        return None
 
-    # Create priority map
-    priority_map = {}
-    for item in result:
-        if isinstance(item, dict) and item.get("name"):
-            priority_map[item["name"].lower()] = item.get("priority", 50)
+    if not result.get("found"):
+        return None
 
-    # Sort contacts by priority
-    def get_priority(contact: ExtractedContact) -> int:
-        return priority_map.get(contact.name.lower(), 50)
+    name = result.get("name")
+    if not name or len(name.strip()) < 3 or len(name.strip().split()) < 2:
+        # No name found — check if at least a title/role was clearly mentioned
+        title = result.get("title")
+        if not title:
+            return None
+        # Return title-only signal (name will be None, used as context hint)
+        return ExtractedContact(
+            name="",
+            title=title,
+            source="description_hiring_manager",
+            confidence=0.6
+        )
 
-    contacts.sort(key=get_priority, reverse=True)
-
-    return contacts
+    return ExtractedContact(
+        name=name.strip(),
+        title=result.get("title"),
+        source="description_hiring_manager",
+        confidence=0.95
+    )
 
 
 async def ai_match_linkedin_to_name(

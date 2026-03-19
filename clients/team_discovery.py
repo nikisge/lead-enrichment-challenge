@@ -14,6 +14,7 @@ Cost: $0 extra (no AI for URL discovery, only for contact extraction)
 Time: ~25-30 seconds
 """
 
+import json
 import logging
 import asyncio
 import re
@@ -22,11 +23,11 @@ from dataclasses import dataclass
 from urllib.parse import urlparse, urljoin
 import xml.etree.ElementTree as ET
 
-import httpx
+from curl_cffi.requests import AsyncSession
 from bs4 import BeautifulSoup
 
 from config import get_settings
-from clients.ai_extractor import extract_contacts_from_page, ExtractedContact
+from clients.ai_extractor import extract_contacts_with_priority, ExtractedContact
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +37,25 @@ MAX_PAGE_SIZE = 100_000
 # Maximum text to extract from page
 MAX_TEXT_EXTRACT = 30_000
 
+
+def _sync_full_page_scroll(page) -> None:
+    """Scroll sync Playwright page fully to trigger lazy loading."""
+    try:
+        height = page.evaluate("document.body.scrollHeight")
+        viewport_height = 900
+        current = 0
+        while current < height:
+            current += viewport_height
+            page.evaluate(f"window.scrollTo(0, {current})")
+            page.wait_for_timeout(300)
+        page.wait_for_timeout(1000)
+        page.evaluate("window.scrollTo(0, 0)")
+        page.wait_for_timeout(500)
+        page.evaluate(f"window.scrollTo(0, {height // 2})")
+        page.wait_for_timeout(500)
+    except Exception as e:
+        logger.debug(f"Scroll error: {e}")
+
 # Common team page URL patterns (ordered by priority)
 TEAM_URL_PATTERNS = [
     "/team",
@@ -43,8 +63,12 @@ TEAM_URL_PATTERNS = [
     "/das-team",
     "/ueber-uns",
     "/uber-uns",
+    "/ueber-uns/team",
     "/about-us",
     "/about",
+    "/about/team",
+    "/unternehmen",
+    "/unternehmen/team",
     "/ansprechpartner",
     "/kontakt",
     "/contact",
@@ -57,14 +81,18 @@ TEAM_URL_PATTERNS = [
     "/geschaeftsleitung",
     "/fuehrungsteam",
     "/leadership",
+    "/wir-ueber-uns",
+    "/das-sind-wir",
 ]
 
 # Keywords to find team links on homepage (German + English)
 TEAM_LINK_KEYWORDS = [
     "team", "über uns", "ueber uns", "about us", "about",
-    "ansprechpartner", "kontakt", "contact", "mitarbeiter",
-    "menschen", "people", "wir über uns", "das sind wir",
-    "management", "geschäftsführung", "leadership", "unternehmen"
+    "ansprechpartner", "mitarbeiter", "menschen", "people",
+    "wir über uns", "das sind wir", "management",
+    "geschäftsführung", "leadership", "unternehmen",
+    "über ", "ueber ",  # catches "Über moresophy", "Über das Team" etc.
+    "kontakt", "contact",
 ]
 
 # Team-specific CSS selectors to wait for
@@ -108,20 +136,12 @@ class TeamDiscovery:
     def __init__(self):
         settings = get_settings()
         self.timeout = settings.api_timeout
-        self._http_client: Optional[httpx.AsyncClient] = None
+        self._http_client: Optional[AsyncSession] = None
 
-    async def _get_client(self) -> httpx.AsyncClient:
-        """Get or create HTTP client."""
-        if self._http_client is None or self._http_client.is_closed:
-            self._http_client = httpx.AsyncClient(
-                timeout=10,  # Quick timeout for URL checks
-                follow_redirects=True,
-                headers={
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                    "Accept-Language": "de-DE,de;q=0.9,en;q=0.8",
-                }
-            )
+    async def _get_client(self) -> AsyncSession:
+        """Get or create curl_cffi session with Chrome 136 impersonation."""
+        if self._http_client is None:
+            self._http_client = AsyncSession(impersonate="chrome136")
         return self._http_client
 
     async def discover_and_extract(
@@ -129,6 +149,7 @@ class TeamDiscovery:
         company_name: str,
         domain: Optional[str] = None,
         job_category: Optional[str] = None,
+        target_titles: List[str] = [],
         max_pages: int = 2
     ) -> TeamDiscoveryResult:
         """
@@ -144,10 +165,14 @@ class TeamDiscovery:
             company_name: Company name
             domain: Company domain (required for website scraping)
             job_category: Job category for relevance
+            target_titles: Ideal decision-maker titles for contact scoring
 
         Returns:
             TeamDiscoveryResult with contacts and metadata
         """
+        # Store for use in _scrape_team_page
+        self._job_category = job_category
+        self._target_titles = target_titles
         logger.info(f"━━━ TEAM DISCOVERY START: {company_name} ━━━")
 
         if not domain:
@@ -188,18 +213,19 @@ class TeamDiscovery:
             else:
                 logger.info("✗ No team pages in sitemap (or no sitemap)")
 
-        # Step 3: Scan homepage for team links
-        if len(discovered_pages) < 2:
-            logger.info("📍 Step 3: Scanning homepage for team links...")
-            homepage_links = await self._scan_homepage_links(base_url)
+        # Step 3: Always scan homepage for team links — this catches custom nav URLs
+        # like /ueber-moresophy that can't be guessed by pattern lists or sitemap keywords.
+        # Fast operation: no AI, just <a> tag parsing.
+        logger.info("📍 Step 3: Scanning homepage for team links...")
+        homepage_links = await self._scan_homepage_links(base_url)
 
-            if homepage_links:
-                logger.info(f"✓ Found {len(homepage_links)} team link(s) on homepage")
-                for page in homepage_links:
-                    logger.info(f"  → {page.url} ('{page.title}')")
-                discovered_pages.extend(homepage_links)
-            else:
-                logger.info("✗ No team links found on homepage")
+        if homepage_links:
+            logger.info(f"✓ Found {len(homepage_links)} team link(s) on homepage")
+            for page in homepage_links:
+                logger.info(f"  → {page.url} ('{page.title}')")
+            discovered_pages.extend(homepage_links)
+        else:
+            logger.info("✗ No team links found on homepage")
 
         # Deduplicate and sort by relevance
         discovered_pages = self._deduplicate_pages(discovered_pages)
@@ -336,7 +362,7 @@ class TeamDiscovery:
     async def _parse_sitemap_urls(
         self,
         sitemap_url: str,
-        client: httpx.AsyncClient,
+        client: AsyncSession,
         xml_content: Optional[str] = None
     ) -> List[DiscoveredPage]:
         """Parse a sitemap and find team-related URLs."""
@@ -362,20 +388,32 @@ class TeamDiscovery:
                 if not url:
                     continue
 
-                url_lower = url.lower()
+                # Only check the top-level path segments (max depth 2) to avoid
+                # matching blog posts like /blog/post-about-the-hype or
+                # /blog/something/management-tips which are not team pages.
+                try:
+                    path_segments = urlparse(url).path.lower().strip('/').split('/')
+                    # Exclude deep paths (blog posts, articles) — team pages are shallow
+                    if len(path_segments) > 2:
+                        continue
+                    top_path = '/'.join(path_segments)
+                except Exception:
+                    continue
 
-                # Check if URL contains team-related keywords
+                # Check if a top-level segment IS a team-related keyword (exact or prefix match)
                 team_keywords = [
                     'team', 'ueber-uns', 'uber-uns', 'about',
                     'kontakt', 'contact', 'ansprechpartner',
                     'mitarbeiter', 'menschen', 'people',
-                    'management', 'fuehrung', 'leadership'
+                    'management', 'fuehrung', 'leadership',
+                    'unternehmen', 'ueber', 'uber',
                 ]
 
                 for keyword in team_keywords:
-                    if keyword in url_lower:
-                        # Score based on keyword position in list (earlier = more relevant)
-                        score = 0.8 - (team_keywords.index(keyword) * 0.05)
+                    # Match if keyword IS a segment or the segment STARTS WITH it
+                    # e.g. /ueber-moresophy matches 'ueber', /team-members matches 'team'
+                    if any(seg == keyword or seg.startswith(keyword + '-') for seg in path_segments):
+                        score = 0.8 - (team_keywords.index(keyword) * 0.04)
                         pages.append(DiscoveredPage(
                             url=url,
                             source="sitemap",
@@ -490,6 +528,20 @@ class TeamDiscovery:
             raw_text = body.get_text(separator=" ", strip=True)
             logger.info(f"📄 Raw body text: {len(raw_text)} chars")
 
+        # For SPAs (Next.js/React), extract SSR JSON from __NEXT_DATA__ or JSON-LD
+        # before stripping script tags — the rendered text lives there
+        ssr_text = ""
+        next_data_tag = soup.find("script", id="__NEXT_DATA__")
+        if next_data_tag and next_data_tag.string:
+            try:
+                import json as _json
+                next_data = _json.loads(next_data_tag.string)
+                # Flatten to string - person names/titles are buried in the props tree
+                ssr_text = _json.dumps(next_data, ensure_ascii=False)[:MAX_TEXT_EXTRACT]
+                logger.info(f"📦 Extracted __NEXT_DATA__ SSR content: {len(ssr_text)} chars")
+            except Exception:
+                pass
+
         # Remove non-content elements
         for elem in soup(["script", "style", "nav", "noscript", "svg", "iframe"]):
             elem.decompose()
@@ -507,7 +559,9 @@ class TeamDiscovery:
             section_texts = []
             for section in team_sections[:5]:  # Max 5 sections
                 section_text = section.get_text(separator="\n", strip=True)
-                if len(section_text) > 50:
+                # Team member cards can be very short (e.g. "Thomas\nTeamleiter Windows")
+                # Lower threshold to 15 chars to avoid dropping valid name+title cards
+                if len(section_text) > 15:
                     section_texts.append(section_text)
             text = "\n\n".join(section_texts)
             logger.info(f"📦 Extracted from {len(team_sections)} team section(s): {len(text)} chars")
@@ -517,143 +571,190 @@ class TeamDiscovery:
             text = soup.get_text(separator="\n", strip=True)
             logger.info(f"📦 Fallback to full body: {len(text)} chars")
 
+        # Last resort: use SSR JSON data from Next.js for SPAs with no visible text
+        if len(text) < 100 and ssr_text:
+            text = ssr_text
+            logger.info(f"📦 Using SSR/Next.js data as text source: {len(text)} chars")
+
         # Truncate if needed
         if len(text) > MAX_TEXT_EXTRACT:
             text = text[:MAX_TEXT_EXTRACT]
             logger.info(f"📦 Truncated to {MAX_TEXT_EXTRACT} chars")
 
-        # Skip AI extraction if we have almost no text
-        if len(text) < 100:
+        # Skip AI extraction if we have almost no text — 500 chars minimum to
+        # avoid wasting LLM calls on bot-block pages that return ~200 chars of boilerplate
+        if len(text) < 500:
             logger.warning(f"⚠️ Not enough text for extraction ({len(text)} chars)")
             return []
 
-        # Use AI to extract contacts
-        logger.info(f"🤖 Running AI contact extraction...")
-        return await extract_contacts_from_page(text, company_name, "team")
+        # Bonus Fix 9: Try JSON-LD structured data first (free, no LLM needed)
+        json_ld_contacts = self._extract_json_ld_contacts(html)
+        if json_ld_contacts:
+            logger.info(f"📋 JSON-LD extracted {len(json_ld_contacts)} contacts (structured data)")
+
+        # Use AI to extract contacts with priority scoring (single merged LLM call)
+        logger.info(f"🤖 Running AI contact extraction with priority scoring...")
+        ai_contacts = await extract_contacts_with_priority(
+            text,
+            company_name,
+            job_category=getattr(self, '_job_category', None),
+            target_titles=getattr(self, '_target_titles', [])
+        )
+
+        # Prepend JSON-LD contacts (structured data is more reliable than AI extraction)
+        if json_ld_contacts:
+            seen = {c.name.lower() for c in json_ld_contacts}
+            for c in ai_contacts:
+                if c.name.lower() not in seen:
+                    json_ld_contacts.append(c)
+            return json_ld_contacts
+
+        return ai_contacts
+
+    def _extract_json_ld_contacts(self, html: str) -> List[ExtractedContact]:
+        """
+        Extract contacts from Schema.org / JSON-LD structured data.
+
+        No LLM, no HTTP — pure JSON parse of HTML already fetched.
+        Many DACH company websites embed <script type="application/ld+json">
+        with @type: Person or Organization employee arrays.
+        """
+        try:
+            soup = BeautifulSoup(html, 'lxml')
+        except Exception:
+            return []
+
+        contacts = []
+        for tag in soup.find_all('script', type='application/ld+json'):
+            try:
+                data = json.loads(tag.string or '')
+            except (json.JSONDecodeError, AttributeError, TypeError):
+                continue
+
+            if not isinstance(data, dict):
+                continue
+
+            schema_type = data.get('@type', '')
+
+            # Handle @type: Person directly
+            if schema_type == 'Person':
+                name = data.get('name', '').strip()
+                if name and len(name.split()) >= 2:
+                    contacts.append(ExtractedContact(
+                        name=name,
+                        title=data.get('jobTitle'),
+                        email=data.get('email'),
+                        phone=data.get('telephone'),
+                        source='team_json_ld',
+                        confidence=0.95
+                    ))
+
+            # Handle @type: Organization — look for employee arrays
+            elif schema_type in ('Organization', 'LocalBusiness', 'Corporation'):
+                for employee in data.get('employee', []):
+                    if not isinstance(employee, dict):
+                        continue
+                    name = employee.get('name', '').strip()
+                    if name and len(name.split()) >= 2:
+                        contacts.append(ExtractedContact(
+                            name=name,
+                            title=employee.get('jobTitle'),
+                            email=employee.get('email'),
+                            source='team_json_ld',
+                            confidence=0.95
+                        ))
+
+        return contacts
 
     async def _scrape_with_playwright_v2(self, url: str) -> Optional[str]:
         """
         Improved Playwright scraping for JS-heavy team pages.
-
-        Improvements over v1:
-        - Wait for team-specific selectors
-        - Longer initial wait (8s instead of 4s)
-        - Full page scroll (top → bottom → top)
-        - Multiple scroll passes for lazy loading
+        Uses sync Playwright in a thread executor to avoid event loop conflicts on Windows.
         """
-        try:
-            from playwright.async_api import async_playwright
+        import asyncio
 
-            logger.info(f"🎭 Starting Playwright (improved settings)...")
+        def _sync_scrape() -> Optional[str]:
+            try:
+                from playwright.sync_api import sync_playwright
 
-            async with async_playwright() as p:
-                browser = await p.chromium.launch(
-                    headless=True,
-                    args=['--disable-http2', '--disable-blink-features=AutomationControlled']
-                )
-                try:
-                    context = await browser.new_context(
-                        viewport={'width': 1280, 'height': 900},
-                        user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+                logger.info(f"🎭 Starting Playwright (improved settings)...")
+
+                with sync_playwright() as p:
+                    browser = p.chromium.launch(
+                        headless=True,
+                        args=['--disable-http2', '--disable-blink-features=AutomationControlled']
                     )
-                    page = await context.new_page()
-
-                    # Navigate with longer timeout
-                    logger.info(f"  → Navigating to {url}")
                     try:
-                        await page.goto(url, wait_until='domcontentloaded', timeout=20000)
-                    except Exception as e:
-                        logger.warning(f"  ⚠️ Navigation error: {e}")
-                        return None
+                        context = browser.new_context(
+                            viewport={'width': 1280, 'height': 900},
+                            user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+                        )
+                        page = context.new_page()
 
-                    # Wait for network to settle
-                    logger.info(f"  → Waiting for network idle...")
-                    try:
-                        await page.wait_for_load_state('networkidle', timeout=10000)
-                    except Exception:
-                        logger.debug(f"  → Network idle timeout (continuing)")
-
-                    # Try to wait for team-specific selectors
-                    logger.info(f"  → Looking for team content selectors...")
-                    team_found = False
-                    for selector in TEAM_PAGE_SELECTORS[:10]:  # Check first 10 selectors
+                        logger.info(f"  → Navigating to {url}")
                         try:
-                            await page.wait_for_selector(selector, timeout=2000)
-                            logger.info(f"  ✓ Found team selector: {selector}")
-                            team_found = True
-                            break
+                            page.goto(url, wait_until='domcontentloaded', timeout=20000)
+                        except Exception as e:
+                            logger.warning(f"  ⚠️ Navigation error: {e}")
+                            return None
+
+                        try:
+                            page.wait_for_load_state('networkidle', timeout=10000)
                         except Exception:
-                            continue
+                            logger.debug("  → Network idle timeout (continuing)")
 
-                    if not team_found:
-                        # No team selector found - wait longer for JS to render
-                        logger.info(f"  → No team selectors found, waiting 8s for JS...")
-                        await page.wait_for_timeout(8000)
-                    else:
-                        # Team selector found - small additional wait
-                        await page.wait_for_timeout(2000)
+                        # Try to wait for team-specific selectors
+                        team_found = False
+                        for selector in TEAM_PAGE_SELECTORS[:10]:
+                            try:
+                                page.wait_for_selector(selector, timeout=2000)
+                                logger.info(f"  ✓ Found team selector: {selector}")
+                                team_found = True
+                                break
+                            except Exception:
+                                continue
 
-                    # Full page scroll to trigger lazy loading
-                    logger.info(f"  → Scrolling page to load lazy content...")
-                    await self._full_page_scroll(page)
+                        wait_ms = 2000 if team_found else 8000
+                        page.wait_for_timeout(wait_ms)
 
-                    # Get final content
-                    html = await page.content()
-                    logger.info(f"  ✓ Got {len(html)} bytes HTML")
+                        # Full page scroll to trigger lazy loading
+                        logger.info("  → Scrolling page to load lazy content...")
+                        _sync_full_page_scroll(page)
 
-                    if len(html) > MAX_PAGE_SIZE:
-                        html = html[:MAX_PAGE_SIZE]
+                        html = page.content()
+                        logger.info(f"  ✓ Got {len(html)} bytes HTML")
+                        # < 1KB after JS execution = bot-block redirect, not real content
+                        if len(html) < 1024:
+                            logger.warning(f"  ⚠️ HTML too small ({len(html)} bytes) — likely bot-blocked, skipping")
+                            return None
+                        # Do NOT truncate Playwright HTML here — the first 100KB is often
+                        # just React/JS bundles. BeautifulSoup handles large DOMs fine and
+                        # text truncation happens AFTER extraction in _scrape_team_page.
+                        return html
 
-                    return html
+                    finally:
+                        browser.close()
 
-                finally:
-                    await browser.close()
+            except ImportError:
+                logger.warning("⚠️ Playwright not installed")
+                return None
+            except Exception as e:
+                logger.warning(f"❌ Playwright error: {e}")
+                return None
 
-        except ImportError:
-            logger.warning("⚠️ Playwright not installed")
-            return None
-        except Exception as e:
-            logger.warning(f"❌ Playwright error: {e}")
-            return None
-
-    async def _full_page_scroll(self, page) -> None:
-        """
-        Scroll page fully to trigger all lazy loading.
-
-        Pattern: Scroll down in steps, wait, then scroll back up.
-        """
         try:
-            # Get page height
-            height = await page.evaluate("document.body.scrollHeight")
-            viewport_height = 900
-
-            # Scroll down in steps
-            current = 0
-            while current < height:
-                current += viewport_height
-                await page.evaluate(f"window.scrollTo(0, {current})")
-                await page.wait_for_timeout(300)
-
-            # Wait at bottom
-            await page.wait_for_timeout(1000)
-
-            # Scroll back to top
-            await page.evaluate("window.scrollTo(0, 0)")
-            await page.wait_for_timeout(500)
-
-            # Final scroll to middle (where team often is)
-            await page.evaluate(f"window.scrollTo(0, {height // 2})")
-            await page.wait_for_timeout(500)
-
+            loop = asyncio.get_event_loop()
+            return await loop.run_in_executor(None, _sync_scrape)
         except Exception as e:
-            logger.debug(f"Scroll error: {e}")
+            logger.warning(f"❌ Playwright executor failed: {e}")
+            return None
 
     async def _scrape_with_httpx(self, url: str) -> Optional[str]:
-        """Fallback scraping with httpx (no JS rendering)."""
+        """Fallback scraping with curl_cffi (Chrome 136 TLS fingerprint)."""
         client = await self._get_client()
 
         try:
-            response = await client.get(url, timeout=15)
+            response = await client.get(url, timeout=15, allow_redirects=True)
             if response.status_code != 200:
                 return None
 
@@ -664,7 +765,7 @@ class TeamDiscovery:
             return content
 
         except Exception as e:
-            logger.debug(f"httpx scrape failed: {e}")
+            logger.debug(f"curl_cffi scrape failed: {e}")
             return None
 
     def _deduplicate_pages(self, pages: List[DiscoveredPage]) -> List[DiscoveredPage]:
@@ -693,16 +794,18 @@ class TeamDiscovery:
         return unique
 
     async def close(self):
-        """Close HTTP client."""
-        if self._http_client and not self._http_client.is_closed:
-            await self._http_client.aclose()
+        """Close curl_cffi session."""
+        if self._http_client:
+            await self._http_client.close()
+            self._http_client = None
 
 
 # Convenience function (maintains backwards compatibility)
 async def discover_team_contacts(
     company_name: str,
     domain: Optional[str] = None,
-    job_category: Optional[str] = None
+    job_category: Optional[str] = None,
+    target_titles: List[str] = []
 ) -> TeamDiscoveryResult:
     """
     Discover team contacts for a company.
@@ -714,7 +817,8 @@ async def discover_team_contacts(
         return await discovery.discover_and_extract(
             company_name=company_name,
             domain=domain,
-            job_category=job_category
+            job_category=job_category,
+            target_titles=target_titles
         )
     finally:
         await discovery.close()
