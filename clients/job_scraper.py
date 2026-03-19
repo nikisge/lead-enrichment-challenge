@@ -24,7 +24,7 @@ from typing import Optional, List
 from dataclasses import dataclass
 from urllib.parse import urlparse
 
-import httpx
+from curl_cffi.requests import AsyncSession
 from bs4 import BeautifulSoup
 
 logger = logging.getLogger(__name__)
@@ -120,110 +120,79 @@ class JobUrlScraper:
         return None
 
     async def _scrape_with_httpx(self, url: str) -> Optional[str]:
-        """Fast scraping with httpx (no JS rendering)."""
-        MAX_SIZE = 2 * 1024 * 1024  # 2MB max - job postings are never bigger
+        """Fast scraping with curl_cffi (Chrome 136 TLS fingerprint, no bot headers)."""
+        MAX_SIZE = 2 * 1024 * 1024  # 2MB max
 
         try:
-            async with httpx.AsyncClient(
-                timeout=self.timeout,
-                follow_redirects=True,
-                headers={
-                    'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-                    'Accept-Language': 'de-DE,de;q=0.9,en;q=0.8',
-                }
-            ) as client:
-                # Stream response to check size before loading fully
-                async with client.stream('GET', url) as response:
-                    response.raise_for_status()
-
-                    # Check content-length header if available
-                    content_length = response.headers.get('content-length')
-                    if content_length and int(content_length) > MAX_SIZE:
-                        logger.warning(f"Response too large ({content_length} bytes), skipping")
-                        return None
-
-                    # Read with size limit
-                    chunks = []
-                    total_size = 0
-                    async for chunk in response.aiter_bytes():
-                        total_size += len(chunk)
-                        if total_size > MAX_SIZE:
-                            logger.warning(f"Response exceeded {MAX_SIZE} bytes, truncating")
-                            break
-                        chunks.append(chunk)
-
-                    return b''.join(chunks).decode('utf-8', errors='ignore')
+            async with AsyncSession(impersonate="chrome136") as session:
+                response = await session.get(url, timeout=self.timeout, allow_redirects=True)
+                response.raise_for_status()
+                content = response.text
+                if len(content) > MAX_SIZE:
+                    logger.warning(f"Response too large, truncating to {MAX_SIZE} bytes")
+                    content = content[:MAX_SIZE]
+                return content
 
         except Exception as e:
-            logger.warning(f"httpx scraping failed: {e}")
+            logger.warning(f"curl_cffi scraping failed: {e}")
             return None
 
     async def _scrape_with_playwright(self, url: str) -> Optional[str]:
-        """JS-rendering with Playwright (slower but works for dynamic sites)."""
-        MAX_HTML_SIZE = 2 * 1024 * 1024  # 2MB max
+        """JS-rendering with Playwright via thread executor (avoids event loop conflicts on Windows)."""
+        import asyncio
+        loop = asyncio.get_event_loop()
+        timeout_ms = self.timeout * 1000
 
-        try:
-            from playwright.async_api import async_playwright
-
-            # Use semaphore to limit concurrent browsers (RAM protection)
-            async with _playwright_semaphore:
-                logger.info("Acquired Playwright semaphore, starting browser...")
-
-                async with async_playwright() as p:
-                    # Launch with extra args to avoid protocol errors
-                    browser = await p.chromium.launch(
+        def _sync_scrape() -> Optional[str]:
+            MAX_HTML_SIZE = 2 * 1024 * 1024  # 2MB max
+            try:
+                from playwright.sync_api import sync_playwright
+                with sync_playwright() as p:
+                    browser = p.chromium.launch(
                         headless=True,
                         args=['--disable-http2', '--disable-blink-features=AutomationControlled']
                     )
                     try:
-                        context = await browser.new_context(
+                        context = browser.new_context(
                             viewport={'width': 1280, 'height': 720},
                             user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
                             extra_http_headers={
                                 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
                                 'Accept-Language': 'de-DE,de;q=0.9,en;q=0.8',
-                                'Accept-Encoding': 'gzip, deflate, br',
                             }
                         )
-                        page = await context.new_page()
-
-                        # Try networkidle first, fallback to domcontentloaded
+                        page = context.new_page()
                         try:
-                            await page.goto(url, wait_until='networkidle', timeout=self.timeout * 1000)
-                        except Exception as e:
-                            logger.debug(f"networkidle failed ({e}), trying domcontentloaded")
+                            page.goto(url, wait_until='networkidle', timeout=timeout_ms)
+                        except Exception:
                             try:
-                                await page.goto(url, wait_until='domcontentloaded', timeout=self.timeout * 1000)
+                                page.goto(url, wait_until='domcontentloaded', timeout=timeout_ms)
                             except Exception as e2:
-                                logger.warning(f"Both navigation methods failed: {e2}")
+                                logger.warning(f"Playwright navigation failed: {e2}")
                                 return None
-
-                        # Wait for content to load
-                        await page.wait_for_timeout(2000)
-
-                        # Scroll to trigger lazy loading
-                        await page.evaluate("window.scrollTo(0, document.body.scrollHeight / 2)")
-                        await page.wait_for_timeout(500)
-
-                        # Get page content with size limit
-                        html = await page.content()
-
+                        page.wait_for_timeout(2000)
+                        page.evaluate("window.scrollTo(0, document.body.scrollHeight / 2)")
+                        page.wait_for_timeout(500)
+                        html = page.content()
                         if len(html) > MAX_HTML_SIZE:
-                            logger.warning(f"Playwright HTML too large ({len(html)} bytes), truncating")
                             html = html[:MAX_HTML_SIZE]
-
                         logger.debug(f"Playwright got {len(html)} bytes from {url}")
                         return html
-
                     finally:
-                        await browser.close()
+                        browser.close()
+            except ImportError:
+                logger.warning("Playwright not installed. Run: pip install playwright && playwright install chromium")
+                return None
+            except Exception as e:
+                logger.warning(f"Playwright scraping failed: {e}")
+                return None
 
-        except ImportError:
-            logger.warning("Playwright not installed. Run: pip install playwright && playwright install chromium")
-            return None
+        try:
+            async with _playwright_semaphore:
+                logger.info("Acquired Playwright semaphore, starting browser...")
+                return await loop.run_in_executor(None, _sync_scrape)
         except Exception as e:
-            logger.warning(f"Playwright scraping failed: {e}")
+            logger.warning(f"Playwright executor failed: {e}")
             return None
 
     def _extract_contact(self, html: str, source_url: str) -> Optional[ScrapedContact]:
@@ -357,15 +326,21 @@ class JobUrlScraper:
         if len(words) < 2:
             return False
 
-        # Filter out job titles
-        invalid_patterns = [
-            'präsident', 'teamleiter', 'leiter', 'manager', 'direktor',
-            'geschäftsführ', 'ceo', 'cto', 'cfo', 'gmbh', 'ag',
-            'abteilung', 'personal', 'recruiting', 'team'
-        ]
-
+        # Filter out job titles and legal suffixes using word-set intersection.
+        # Word-set matching prevents false positives on surnames that contain
+        # these strings as substrings (e.g. 'leiter' in 'leitner', 'ag' in 'haagen').
         name_lower = name.lower()
-        if any(p in name_lower for p in invalid_patterns):
+        words_in_name = set(name_lower.split())
+
+        legal_suffixes = {'gmbh', 'ag', 'kg', 'ug', 'mbh', 'ohg', 'gbr'}
+        job_title_words = {
+            'ceo', 'cto', 'cfo', 'coo', 'leiter', 'leiterin',
+            'manager', 'direktor', 'vorstand', 'inhaber', 'chef',
+            'präsident', 'teamleiter',
+            'geschäftsführer', 'geschäftsführerin',
+            'personal', 'recruiting', 'team', 'abteilung',
+        }
+        if words_in_name & (legal_suffixes | job_title_words):
             return False
 
         # Check if words look like names
@@ -408,12 +383,27 @@ class JobUrlScraper:
         context = text[max(0, name_pos - 100):name_pos + len(name) + 100]
 
         title_patterns = [
+            r'(CEO|CTO|CFO|COO|CMO|CIO)',
+            r'(Geschäftsführer(?:in)?)',
+            r'(Inhaber(?:in)?)',
+            r'(IT[\s-]Leiter(?:in)?)',
+            r'(Head\s+of\s+(?:IT|Engineering|Tech(?:nology)?))',
+            r'(Leiter(?:in)?\s+(?:IT|Software|Technik|Entwicklung))',
+            r'(VP\s+Engineering)',
+            r'(Vertriebsleiter(?:in)?)',
+            r'(Head\s+of\s+Sales)',
+            r'(Sales\s+Director)',
+            r'(Leiter(?:in)?\s+Vertrieb)',
+            r'(Finanzleiter(?:in)?)',
+            r'(Head\s+of\s+Finance)',
+            r'(Kaufmännische(?:r)?\s+Leiter(?:in)?)',
             r'(Personalleiter(?:in)?)',
-            r'(HR\s*Manager(?:in)?)',
+            r'(HR[\s-]Manager(?:in)?)',
+            r'(Head\s+of\s+HR)',
             r'(Recruiter(?:in)?)',
             r'(Talent\s*Acquisition)',
-            r'(Geschäftsführer(?:in)?)',
-            r'(CEO|CTO|CFO|COO)',
+            r'(Abteilungsleiter(?:in)?)',
+            r'(Bereichsleiter(?:in)?)',
         ]
 
         for pattern in title_patterns:

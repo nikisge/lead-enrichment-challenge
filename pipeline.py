@@ -15,6 +15,7 @@ Ersetzt regelbasierte Checks durch kontextabhängige KI-Analyse.
 import logging
 import re
 import asyncio
+from collections import Counter
 from typing import Optional, List, Dict, Any
 from urllib.parse import urlparse
 
@@ -40,6 +41,7 @@ from clients.llm_client import get_llm_client
 from clients.ai_extractor import (
     extract_job_posting_contact,
     extract_impressum_data,
+    extract_hiring_manager_from_description,
     ExtractedContact,
     ai_match_email_to_person,
     ai_match_linkedin_to_name
@@ -60,6 +62,52 @@ from utils.cost_tracker import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _resolve_title(
+    candidate_title: Optional[str],
+    inferred_title: Optional[str],
+    role_category: str
+) -> Optional[str]:
+    """
+    Resolve a display title for a DecisionMaker. Never fabricates a specific title.
+
+    Priority:
+    1. Actual title from source (job page, team page, impressum)
+    2. LLM-inferred clean title string (e.g. "CTO", "IT-Leiter")
+    3. Honest category label — useful context without guessing a specific title
+    """
+    if candidate_title:
+        return candidate_title
+    if inferred_title:
+        return inferred_title
+    category_labels = {
+        "department_head": "Fachbereichsleitung",
+        "executive": "Geschäftsführung",
+        "hr": "HR / Personal",
+    }
+    return category_labels.get(role_category)
+
+
+def _apply_exclusion_gate(
+    validated_candidates: List[CandidateValidation]
+) -> List[CandidateValidation]:
+    """
+    Hybrid exclusion gate: if a confirmed department head exists (score ≥ 70),
+    remove all HR-only candidates from the list.
+
+    The categorical label handles the gating decision (deterministic), and the
+    score floor prevents a false-positive dept-head classification from triggering
+    the gate. Robust to ±20 points of LLM scoring variance.
+    """
+    has_dept_head = any(
+        c.role_category == "department_head" and c.relevance_score >= 70
+        for c in validated_candidates
+    )
+    if has_dept_head:
+        return [c for c in validated_candidates if c.role_category != "hr"]
+    return validated_candidates
+
 
 # Domains to skip in search results (job portals, social media, directories, etc.)
 # Shared across DDG, Serper, Google CSE domain discovery
@@ -326,7 +374,7 @@ async def _enrich_lead_inner(
 
     # Check critical API keys at startup
     settings = get_settings()
-    if not settings.anthropic_api_key:
+    if not settings.anthropic_api_key and not settings.openrouter_api_key:
         operational_alerts["anthropic_key_missing"] = True
         logger.warning("ALERT: Anthropic API key is missing!")
     if not settings.openrouter_api_key:
@@ -540,14 +588,22 @@ async def _enrich_lead_inner(
     team_discovery_task = discover_team_contacts(
         company_name=parsed.company_name,
         domain=company_info.domain,
-        job_category=payload.category
+        job_category=parsed.department or payload.category,
+        target_titles=parsed.target_titles
+    )
+
+    hiring_manager_task = extract_hiring_manager_from_description(
+        description=payload.description,
+        company_name=parsed.company_name,
+        job_title=payload.title
     )
 
     # Execute in parallel
-    job_contact, impressum_result, team_result = await asyncio.gather(
+    job_contact, impressum_result, team_result, hiring_manager = await asyncio.gather(
         job_contact_task,
         impressum_task,
         team_discovery_task,
+        hiring_manager_task,
         return_exceptions=True
     )
 
@@ -579,6 +635,13 @@ async def _enrich_lead_inner(
         enrichment_path.append(f"team_discovery_{len(team_result.contacts)}_contacts")
         if team_result.fallback_used:
             enrichment_path.append("team_fallback_linkedin")
+
+    if isinstance(hiring_manager, Exception):
+        logger.warning(f"Hiring manager extraction failed: {hiring_manager}")
+        hiring_manager = None
+    elif hiring_manager and hiring_manager.name:
+        enrichment_path.append("description_hiring_manager_found")
+        logger.info(f"Hiring manager from description: {hiring_manager.name} ({hiring_manager.title or 'no title'})")
 
     # Process Impressum data
     if impressum_result:
@@ -619,6 +682,16 @@ async def _enrich_lead_inner(
 
     logger.info("Collecting and validating candidates...")
     all_candidates: List[Dict[str, Any]] = []
+
+    # Priority 0: Hiring manager directly named in job description (highest trust signal)
+    if hiring_manager and hiring_manager.name:
+        all_candidates.append({
+            "name": hiring_manager.name,
+            "title": hiring_manager.title,
+            "source": "description_hiring_manager",
+            "priority": 110
+        })
+        logger.info(f"Description hiring manager: {hiring_manager.name} ({hiring_manager.title or 'no title'})")
 
     # Priority 1: Contact from job URL (beste Quelle)
     if job_contact and job_contact.name:
@@ -718,6 +791,17 @@ async def _enrich_lead_inner(
 
     enrichment_path.append(f"total_{len(all_candidates)}_raw_candidates")
 
+    # Bonus Fix 10: Multi-source triangulation — candidates appearing in multiple
+    # sources get a multi_source_verified flag that the validator uses as a tiebreaker.
+    name_sources: Counter = Counter(
+        c.get("name", "").strip().lower() for c in all_candidates
+    )
+    for candidate in all_candidates:
+        name_key = candidate.get("name", "").strip().lower()
+        if name_sources[name_key] > 1:
+            candidate["source_count"] = name_sources[name_key]
+            candidate["multi_source_verified"] = True
+
     # ========== PHASE 4: KI-VALIDIERUNG & RANKING ==========
 
     validated_candidates: List[CandidateValidation] = []
@@ -729,8 +813,11 @@ async def _enrich_lead_inner(
             candidates=all_candidates,
             company_name=parsed.company_name,
             company_domain=company_info.domain,
-            job_category=payload.category
+            job_category=parsed.department or payload.category,
+            target_titles=parsed.target_titles,
+            department=parsed.department,
         )
+        validated_candidates = _apply_exclusion_gate(validated_candidates)
         # Note: Tracking happens inside validate_and_rank_candidates (uses Sonnet)
 
         enrichment_path.append(f"validated_{len(validated_candidates)}_candidates")
@@ -761,8 +848,11 @@ async def _enrich_lead_inner(
                     candidates=new_candidates,
                     company_name=parsed.company_name,
                     company_domain=company_info.domain,
-                    job_category=payload.category
+                    job_category=parsed.department or payload.category,
+                    target_titles=parsed.target_titles,
+                    department=parsed.department,
                 )
+                validated_candidates = _apply_exclusion_gate(validated_candidates)
                 enrichment_path.append(f"dm_fallback_post_validation_{len(validated_candidates)}_found")
                 logger.info(f"DM fallback after validation found {len(validated_candidates)} candidates")
                 # Add to all_candidates for later lookup
@@ -1008,7 +1098,7 @@ async def _enrich_lead_inner(
                 name=candidate.name,
                 first_name=names[0] if names else "",
                 last_name=" ".join(names[1:]) if len(names) > 1 else "",
-                title=candidate_data.get("title"),
+                title=_resolve_title(candidate.title, candidate.inferred_title, candidate.role_category),
                 linkedin_url=verified_linkedin,
                 email=candidate.email or candidate_data.get("email"),
                 verified_current=candidate_data.get("verified_current", False),
@@ -1065,7 +1155,7 @@ async def _enrich_lead_inner(
                     name=candidate.name,
                     first_name=first_name,
                     last_name=last_name,
-                    title=candidate_data.get("title"),
+                    title=_resolve_title(candidate.title, candidate.inferred_title, candidate.role_category),
                     linkedin_url=verified_linkedin,
                     email=candidate.email or candidate_data.get("email"),
                     verified_current=candidate_data.get("verified_current", False),
@@ -1090,7 +1180,7 @@ async def _enrich_lead_inner(
             name=best.name,
             first_name=names[0] if names else "",
             last_name=" ".join(names[1:]) if len(names) > 1 else "",
-            title=candidate_data.get("title"),
+            title=_resolve_title(best.title, best.inferred_title, best.role_category),
             linkedin_url=verified_linkedin,
             email=best.email or candidate_data.get("email"),
             verified_current=candidate_data.get("verified_current", False),

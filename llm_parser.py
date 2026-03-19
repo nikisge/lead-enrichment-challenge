@@ -4,10 +4,10 @@ import logging
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Optional, List, Tuple
-from anthropic import AsyncAnthropic
 
 from config import get_settings
 from models import WebhookPayload, ParsedJobPosting
+from clients.llm_client import get_llm_client, ModelTier
 
 logger = logging.getLogger(__name__)
 
@@ -61,7 +61,7 @@ Regeln:
 - Suche nach genannten Ansprechpartnern (oft am Ende: "Ihr Ansprechpartner", "Kontakt", "Bewerbung an")
 - Extrahiere E-Mail-Adressen falls vorhanden (für Kontakt, NICHT für Domain!)
 - Extrahiere Telefonnummern falls vorhanden (Format: +49, 0049, oder 0xxx)
-- Bestimme relevante Titel für Entscheider (HR, Personal, Geschäftsführung)
+- Bestimme den idealen fachlichen Entscheider für DIESE Stelle (z.B. CTO für IT, CFO für Finanzen). HR nur wenn die Stelle selbst im HR-Bereich ist.
 
 Antworte NUR mit validem JSON im folgenden Format (keine anderen Texte):
 {
@@ -78,53 +78,26 @@ Antworte NUR mit validem JSON im folgenden Format (keine anderen Texte):
 
 async def parse_job_posting(payload: WebhookPayload) -> ParsedJobPosting:
     """
-    Use LLM to extract structured info from job posting.
+    Use LLM to extract structured info from job posting via OpenRouter.
     Falls back to regex extraction if LLM fails.
-    Uses fallback API key if primary key fails.
     """
     reset_parse_warnings()
-    settings = get_settings()
 
-    # Try LLM parsing with primary key first, then fallback
-    api_keys = []
-    if settings.anthropic_api_key:
-        api_keys.append(("primary", settings.anthropic_api_key))
-    if settings.anthropic_api_key_fallback:
-        api_keys.append(("fallback", settings.anthropic_api_key_fallback))
+    try:
+        result = await _llm_parse(payload)
+        return result
+    except Exception as e:
+        logger.warning(f"LLM parsing failed: {e}")
 
-    for key_type, api_key in api_keys:
-        try:
-            result = await _llm_parse(payload, api_key)
-            if key_type == "fallback":
-                _get_parse_state().used_fallback = True
-                logger.warning("PRIMARY API KEY FAILED - Used fallback API key successfully")
-            return result
-        except Exception as e:
-            error_msg = str(e)
-            if "credit balance" in error_msg.lower():
-                logger.error(f"API key ({key_type}) has no credits: {e}")
-                if key_type == "primary":
-                    logger.info("Trying fallback API key...")
-                    continue
-            elif "invalid_api_key" in error_msg.lower() or "authentication" in error_msg.lower():
-                logger.error(f"API key ({key_type}) is invalid: {e}")
-                if key_type == "primary":
-                    logger.info("Trying fallback API key...")
-                    continue
-            else:
-                logger.warning(f"LLM parsing failed with {key_type} key: {e}")
-                if key_type == "primary":
-                    continue
-
-    # All API keys failed - use regex fallback
+    # LLM failed - use regex fallback
     logger.warning("All API keys failed, using regex fallback")
     _get_parse_state().warning = "llm_parse_failed_used_regex_fallback"
     return _regex_parse(payload)
 
 
-async def _llm_parse(payload: WebhookPayload, api_key: str) -> ParsedJobPosting:
-    """Parse using Claude Sonnet."""
-    client = AsyncAnthropic(api_key=api_key)
+async def _llm_parse(payload: WebhookPayload) -> ParsedJobPosting:
+    """Parse job posting using OpenRouter LLM client."""
+    llm = get_llm_client()
 
     user_content = f"""Stellenanzeige:
 Firma: {payload.company}
@@ -134,49 +107,17 @@ Ort: {payload.location or 'Nicht angegeben'}
 Beschreibung:
 {payload.description[:6000]}"""
 
-    response = await client.messages.create(
-        model="claude-sonnet-4-20250514",
+    result = await llm.call_json(
+        prompt=user_content,
+        tier=ModelTier.SMART,
+        system_prompt=SYSTEM_PROMPT,
         max_tokens=1024,
-        system=SYSTEM_PROMPT,
-        messages=[
-            {"role": "user", "content": user_content}
-        ]
     )
 
-    content = response.content[0].text
+    if not result or not isinstance(result, dict):
+        raise ValueError(f"LLM returned invalid result: {type(result)}")
 
-    # Extract JSON from response (Claude might add some text around it)
-    # Support nested objects by finding balanced braces
-    content = content.strip()
-
-    # Remove markdown code blocks if present
-    if content.startswith("```json"):
-        content = content[7:]
-    elif content.startswith("```"):
-        content = content[3:]
-    if content.endswith("```"):
-        content = content[:-3]
-    content = content.strip()
-
-    # Try to parse directly first
-    try:
-        data = json.loads(content)
-    except json.JSONDecodeError:
-        # Find JSON object with balanced braces
-        start_idx = content.find('{')
-        if start_idx != -1:
-            brace_count = 0
-            end_idx = start_idx
-            for i, char in enumerate(content[start_idx:], start_idx):
-                if char == '{':
-                    brace_count += 1
-                elif char == '}':
-                    brace_count -= 1
-                    if brace_count == 0:
-                        end_idx = i + 1
-                        break
-            content = content[start_idx:end_idx]
-        data = json.loads(content)
+    data = result
 
     # Ensure target_titles has defaults if empty
     if not data.get("target_titles"):
@@ -261,25 +202,45 @@ def _get_default_titles(job_title: str) -> List[str]:
             "Recruiting Manager", "Head of Recruiting"
         ]
 
-    # IT related
-    if any(x in job_lower for x in ['it', 'software', 'developer', 'engineer', 'tech', 'consultant']):
+    # IT related — use word boundary for 'it' to avoid false positives like 'hospitality', 'digital'
+    if re.search(r'\bit\b', job_lower) or any(x in job_lower for x in ['software', 'developer', 'engineer', 'tech', 'entwickl']):
         return [
-            "IT-Leiter", "Head of IT", "CTO", "IT Manager",
+            "CTO", "IT-Leiter", "Head of IT", "IT Manager",
             "Leiter Softwareentwicklung", "Head of Engineering",
-            "HR Manager", "Personalleiter"
         ]
 
     # Sales related
-    if any(x in job_lower for x in ['sales', 'vertrieb', 'account']):
+    if any(x in job_lower for x in ['sales', 'vertrieb', 'account', 'verkauf']):
         return [
-            "Vertriebsleiter", "Head of Sales", "Sales Director",
-            "Leiter Vertrieb", "HR Manager", "Personalleiter"
+            "Vertriebsleiter", "Vertriebsleiterin", "Head of Sales", "Sales Director",
+            "Leiter Vertrieb", "CSO",
         ]
 
-    # Default: HR + Management
+    # Finance related
+    if any(x in job_lower for x in ['finance', 'finanz', 'finanzen', 'buchhal', 'controlling', 'accounting']):
+        return [
+            "CFO", "Finanzleiter", "Finanzleiterin", "Head of Finance",
+            "Kaufmännischer Leiter", "Controller", "Leiter Finanzen",
+        ]
+
+    # Healthcare/Pflege related
+    if any(x in job_lower for x in ['pflege', 'arzt', 'medizin', 'klinik', 'gesundheit', 'krankenpflege', 'altenpflege']):
+        return [
+            "Pflegedienstleitung", "Ärztlicher Direktor", "Medizinischer Leiter",
+            "Geschäftsführer", "Geschäftsführerin", "CEO",
+        ]
+
+    # Marketing related
+    if any(x in job_lower for x in ['marketing', 'kommunikation', 'brand']):
+        return [
+            "CMO", "Marketingleiter", "Marketingleiterin", "Head of Marketing",
+            "Leiter Marketing", "Leiter Kommunikation",
+        ]
+
+    # Default: CEO-first, HR is fallback only
     return [
+        "Geschäftsführer", "Geschäftsführerin", "CEO", "Inhaber",
         "HR Manager", "Personalleiter", "Personalleiterin",
-        "Geschäftsführer", "Geschäftsführerin", "CEO",
         "Head of HR", "Leiter Personal"
     ]
 
@@ -288,15 +249,30 @@ def _detect_department(job_title: str, category: Optional[str]) -> Optional[str]
     """Detect department from job title or category."""
     text = f"{job_title} {category or ''}".lower()
 
-    if any(x in text for x in ['hr', 'personal', 'recruiting']):
+    if any(x in text for x in ['hr', 'personal', 'recruiting', 'talent']):
         return "HR"
-    if any(x in text for x in ['it', 'software', 'tech', 'developer', 'consultant']):
+    # Use word boundary for 'it' to avoid false positives like 'hospitality', 'digital'
+    if re.search(r'\bit\b', text) or any(x in text for x in ['software', 'tech', 'developer', 'entwickl']):
         return "IT"
-    if any(x in text for x in ['sales', 'vertrieb']):
+    if any(x in text for x in ['sales', 'vertrieb', 'verkauf']):
         return "Sales"
-    if any(x in text for x in ['marketing']):
+    if any(x in text for x in ['marketing', 'kommunikation']):
         return "Marketing"
-    if any(x in text for x in ['finance', 'finanz', 'accounting']):
+    if any(x in text for x in ['finance', 'finanz', 'accounting', 'buchhal', 'controlling']):
         return "Finance"
+    if any(x in text for x in ['logistik', 'logistic', 'supply chain', 'transport', 'versand', 'lagerwirt']):
+        return "Logistik"
+    if any(x in text for x in ['einkauf', 'procurement', 'beschaffung', 'purchasing']):
+        return "Einkauf"
+    if any(x in text for x in ['produktion', 'fertigung', 'manufacturing', 'operations']):
+        return "Produktion"
+    if any(x in text for x in ['pflege', 'altenpflege', 'krankenpflege']):
+        return "Pflege"
+    if any(x in text for x in ['arzt', 'medizin', 'klinik', 'gesundheit', 'pharmaz']):
+        return "Medizin"
+    if any(x in text for x in ['recht', 'jurist', 'anwalt', 'legal', 'compliance']):
+        return "Recht"
+    if any(x in text for x in ['beratung', 'consulting', 'consultant', 'berater']):
+        return "Consulting"
 
     return None
