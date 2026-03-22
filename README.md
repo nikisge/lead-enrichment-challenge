@@ -123,14 +123,30 @@ python test_full_flow.py
 # Or start the server and send a test request
 python -m uvicorn main:app --reload --port 8000
 
-# Test request (example)
-curl -X POST http://localhost:8000/webhook/enrich/sync \
-  -H "Content-Type: application/json" \
-  -d '{
+# Test request (IT job — expects CTO/IT-Leiter over HR)
+curl --request POST \
+  --url http://localhost:8000/webhook/enrich/sync \
+  --header 'content-type: application/json' \
+  --data '{
+    "id": "test-it-1",
+    "title": "Senior Software Engineer (m/w/d)",
+    "company": "TechVision GmbH",
+    "description": "Wir suchen einen Software Engineer für unser Cloud-Team. Python, Go, Kubernetes, AWS. Standort: München. Bewerbung: bewerbung@techvision-gmbh.de",
+    "category": "it",
+    "url": "https://www.techvision-gmbh.de/jobs",
+    "location": "München",
+    "source": "stepstone"
+  }'
+
+# Or test with test_mode (no paid APIs): add ?test_mode=true
+curl --request POST \
+  --url "http://localhost:8000/webhook/enrich/sync?test_mode=true" \
+  --header 'content-type: application/json' \
+  --data '{
     "id": "test-1",
     "title": "Senior Software Engineer",
     "company": "SAP SE",
-    "description": "We are looking for a Senior Software Engineer to join our cloud team...",
+    "description": "We are looking for a Senior Software Engineer for our cloud team.",
     "category": "it",
     "url": "https://www.sap.com/careers",
     "location": "Walldorf, Germany"

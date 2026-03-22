@@ -275,12 +275,15 @@ def _get_default_titles(job_title: str) -> List[str]:
             "Vertriebsleiter", "Head of Sales", "Sales Director",
             "Leiter Vertrieb", "HR Manager", "Personalleiter"
         ]
+    if any(x in job_lower for x in ['finance', 'finanz', 'buchhalt', 'steuer']):
+        return ["CFO", "Finanzleiter", "Head of Finance", "HR Manager", "Personalleiter"]
+    if any(x in job_lower for x in ['pflege', 'arzt', 'medizin', 'klinik', 'healthcare']):
+        return ["Klinikleiter", "Chefarzt", "Medical Director", "Pflegedirektion", "HR Manager", "Personalleiter"]
 
-    # Default: HR + Management
+    # Default: CEO/Inhaber before HR (backup per README)
     return [
-        "HR Manager", "Personalleiter", "Personalleiterin",
-        "Geschäftsführer", "Geschäftsführerin", "CEO",
-        "Head of HR", "Leiter Personal"
+        "Geschäftsführer", "Geschäftsführerin", "CEO", "Inhaber",
+        "HR Manager", "Personalleiter", "Head of HR", "Leiter Personal"
     ]
 
 
